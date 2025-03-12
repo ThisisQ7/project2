@@ -21,6 +21,12 @@
 #include "bt_parse.h"
 #include "input_buffer.h"
 
+#include <assert.h>
+
+#define SHA1_HASH_SIZE 20
+#define LIST_ELEM_SIZE 52
+#define BUF_SIZE 256
+
 void peer_run(bt_config_t *config);
 
 int main(int argc, char **argv) {
@@ -66,8 +72,43 @@ void process_inbound_udp(int sock) {
 }
 
 void process_get(char *chunkfile, char *outputfile) {
-  printf("PROCESS GET SKELETON CODE CALLED.  Fill me in!  (%s, %s)\n", 
+  printf("PROCESS GET SKELETON CODE CALLED. (%s, %s)\n", 
 	chunkfile, outputfile);
+
+  //First, we access the chunks the user wishses to obtain
+  FILE *f;
+  int chunks_count = 0;
+  char chunk_hash[SHA1_HASH_SIZE], list_elem[LIST_ELEM_SIZE];
+
+  f = fopen(chunkfile, "r");
+  assert(f != NULL);
+  
+  while (fgets(list_elem, BT_FILENAME_LEN, f) != NULL) {
+    chunks_count++; //count how many lines of chunks
+    printf("chunk line: %s and size of line: %d \n", list_elem, sizeof(list_elem));
+  }
+  chunk_t *chunks = malloc (sizeof(chunk_t)*chunks_count);
+  fseek(f, 0, SEEK_SET); //go back to the beginnin of the file
+
+  int i = 0;
+  char read_buff[BUF_SIZE];
+  char hash_buffer[SHA1_HASH_SIZE * 2];
+
+  //Initialize chunk
+  while (fgets(read_buff, BT_FILENAME_LEN, f) != NULL){
+    sscanf(read_buff, "%d %s", &(chunks[i].id), hash_buffer);
+    hex2binary(hash_buffer, SHA1_HASH_SIZE*2, chunk[i].hash);//ASCII hash to binary
+    chunks[i].data = malloc(512 * 1024); //chunk data(512kb)
+    if(!chunks[i].data){
+      free(chunks[i].data);
+      perror("Error alloc chunk data");
+      exit(EXIT_FAILURE);
+    }
+    i++;
+  }
+  
+  fclose(file);
+  make_whohas(chunks, chunks_count);
 }
 
 void handle_user_input(char *line, void *cbdata) {
