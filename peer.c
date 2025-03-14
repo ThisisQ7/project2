@@ -98,6 +98,68 @@ int main(int argc, char **argv) {
 }
 
 /**
+ * make_packets
+ * 
+ * make packets
+ * 
+ */
+packet_t *make_packet (int type, short p_len, uint32_t seq, uint32_t ack, char *data){
+    packet_t *p = (packet_t *)malloc(sizeof(packet_t));
+    if (!p){
+      perror("Error alloc packet_t *p");
+      exit(EXIT_FAILURE);
+    }
+    p->header.magicnum = htons((short)15441); 
+    p->header.version = (char)1;
+    p->header.packet_type = (char) type;
+    p->header.header_len = htons((short)HEADERLEN);
+    p->header.packet_len = htons(p_len);
+    p->header.seq_num = htonl(seq);
+    p->header.ack_num = htonl(ack);
+    //if (p->data != NULL) 
+    if ((p_len - HEADERLEN) > DATALEN) {
+        fprintf(stderr, "Error: Attempting to copy too much data into packet\n");
+        exit(EXIT_FAILURE);
+    }
+    if (data != NULL) 
+        memcpy(p->data, data, p_len - HEADERLEN);
+    return p;
+}
+
+//Helper that further processes the chunkfile to obtain each chunk_hash
+chunk_t *process_chunkfile(char *chunkfile, int *num_chunks){
+  FILE *f;
+  char list_elem[LIST_ELEM_SIZE];
+
+  f = fopen(chunkfile, "r");
+  assert(f != NULL);
+ 
+  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
+    (*num_chunks)++;        
+  }
+
+  printf("number of chunks function side : %d \n", (*num_chunks));
+  chunk_t *res = (chunk_t *)malloc((*num_chunks) * sizeof(chunk_t)); //to free
+
+  fseek(f, 0, SEEK_SET);
+  int curr = 0;
+  int id;
+  char hashbuf[40];
+
+  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
+    sscanf(list_elem, "%d %s", &id, hashbuf);
+    res[curr].id = id;
+    hex2binary(hashbuf, 40, res[curr].hash);
+    //binary2hex(res[curr].hash, 20, hashbuf);
+    
+    curr++;
+
+   }
+  return res;
+}
+
+
+/**
  * packet_parse
  * 
  * 
@@ -128,157 +190,170 @@ int packet_parser(packet_t* pkt) {
   return type;
 }
 
-void process_inbound_udp(int sock) {
+
+void process_whohas_packet(packet_t *pkt, struct sockaddr_in *from, 
+                           char *haschunk, int sock) {
+
+    int num_local = 0;
+    chunk_t *local_chunks = process_chunkfile(haschunk, &num_local);
+    int hash_count = (unsigned char) pkt->data[0];
+    printf("Processing WHOHAS packet: %d hash(es) requested\n", hash_count);
+    
+    unsigned char *available_hashes = malloc(hash_count * SHA1_HASH_SIZE);
+    if (!available_hashes) {
+        perror("malloc available_hashes failed");
+        exit(EXIT_FAILURE);
+    }
+    int available_count = 0;
+    
+    // Iterate over each hash in the WHOHAS packet.
+    for (int i = 0; i < hash_count; i++) {
+        int offset = 4 + i * SHA1_HASH_SIZE;
+        unsigned char *current_hash = (unsigned char *) pkt->data + offset;
+        
+        // Check if this hash matches any chunk in our local chunk list.
+        for (int j = 0; j < num_local; j++) {
+            
+            if (memcmp(current_hash, local_chunks[j].hash, SHA1_HASH_SIZE) == 0) {
+                // Match found: copy the hash into our available list.
+                memcpy(available_hashes + available_count * SHA1_HASH_SIZE,
+                       current_hash, SHA1_HASH_SIZE);
+                available_count++;
+                break; // No need to check other local chunks for this hash.
+            }
+        }
+    }
+    
+    // If any matching chunks were found, send an IHAVE response.
+    if (available_count > 0) {
+        printf("available_count: %d \n", available_count);
+        int ihave_data_size = 4 + available_count * SHA1_HASH_SIZE;
+        char *ihave_data = malloc(ihave_data_size);
+        if (!ihave_data) {
+            perror("malloc ihave_data failed");
+            exit(EXIT_FAILURE);
+        }
+        memset(ihave_data, 0, ihave_data_size);
+        ihave_data[0] = (char) available_count;
+        
+        // Copy each matching hash into the payload after the first 4 bytes.
+        for (int i = 0; i < available_count; i++) {
+            memcpy(ihave_data + 4 + i * SHA1_HASH_SIZE,
+                   available_hashes + i * SHA1_HASH_SIZE, SHA1_HASH_SIZE);
+        }
+                
+        // Create the IHAVE packet. 
+        packet_t *ihave_pkt = make_packet(IHAVE, HEADERLEN + ihave_data_size, 0, 0, ihave_data);
+        
+        // Send the IHAVE packet back to the from.
+        spiffy_sendto(sock, ihave_pkt, sizeof(packet_t), 0,
+                      (struct sockaddr *)from, sizeof(*from));
+        printf("Sent IHAVE packet with %d hash(es) to %s:%d\n", available_count,
+               inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+        
+        free(ihave_pkt);
+        free(ihave_data);
+    } else {
+        printf("No matching chunks found for WHOHAS request from %s:%d\n",
+               inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+    }
+    
+    free(available_hashes);
+}
+
+void process_inbound_udp(int sock, bt_config_t *config) {
   struct sockaddr_in from;
   socklen_t fromlen;
   char buf[BUFLEN];
  
   fromlen = sizeof(from);
-  int recv_len = spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
-  if(recv_len < HEADERLEN){
-    printf("Received packet shorter than HEADERLEN: %d bytes \n", recv_len);
-    return;
-  }
+  int recv_len;
+  while ((recv_len = spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen))!= -1){
+  //recv_len = spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
 
-  packet_t* pkt = (packet_t*) buf;
-  int type = packet_parser(pkt);
-  if (type == -1){
-    printf("something is wrong, check packet type \n");
-    return;
-  }
-  //printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
-  //  "Incoming message from %s:%d\n%s\n\n", 
-  //  inet_ntoa(from.sin_addr),
-  //  ntohs(from.sin_port),
-  //  buf);
-  switch(type){
-    case WHOHAS:{
-      int hash_num = (unsigned char) pkt->data[0];
-      printf("Received WHOHAS packet from %s:%d with %d hash(es)\n", 
-              inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
-      // TODO: For each hash in pkt->data, check if I (current peer) has 
-      // the corresponding chunk. if yes, prepare an IHAVE response and send it.
-      break;
+    if(recv_len < HEADERLEN){
+      printf("Received packet shorter than HEADERLEN: %d bytes \n", recv_len);
+      return;
     }
-    case IHAVE:{
-      int hash_num = (unsigned char) pkt->data[0];
-      printf("Received IHAVE packet from %s:%d with %d hash(es)\n", 
-              inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
-      // TODO: Update internal state to record which chunks the sender possesses.
-      // send GET as soon as I get "IHAVE" from a peer?
-      break;
+
+    packet_t* pkt = (packet_t*) buf;
+    printf("Raw Packet Received: Type=%d, Magic=%d, Length=%d\n",
+          pkt->header.packet_type, ntohs(pkt->header.magicnum), ntohs(pkt->header.packet_len));
+    int type = packet_parser(pkt);
+    if (type == -1){
+      printf("something is wrong, check packet type \n");
+      return;
     }
-    case GET:{
-      printf("Received GET packet from %s:%d\n", 
-              inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-      // save the requested hash
-      unsigned char requested_hash[SHA1_HASH_SIZE];
-      memcpy(requested_hash, pkt->data, SHA1_HASH_SIZE);
-      // TODO: Check if I (current peer) have this chunk, if I have,
-      // start sending DATA packet for this chunk. if I do not have,
-      // send DENIED(? or should I ignore this)
-      break;
-    }
-    case DATA:{
-      uint32_t seq_num = ntohl(pkt->header.seq_num);
-      int data_len = recv_len - HEADERLEN;
-      printf("Received DATA packet (seq=%d) from %s:%d, data length=%d bytes\n", 
-              seq_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port), data_len);
-      // TODO: Process the received the data:
-      // save the data, update expecting chunks(sequence number?), 
-      // send ACK to the sender
-      break;
-    }
-    case ACK:{
-      uint32_t ack_num = ntohl(pkt->header.ack_num);
-      printf("Received ACK (ack=%d) from %s:%d\n", 
-              ack_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-      // TODO: Update sender("I", as in this peer) state:
-      // sliding window, update timer (not sure if there is more?)
-      break;
-    }
-    case DENIED:{
-      printf("Received DENIED from %s:%d\n", 
-              inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-    // TODO: Handle the denial
-    // mark the peer as unavailable (remove the peer from the list 
-    // of peers that has this chunk? we need data structure to keep
-    // track of this then)
-    // request the chunk from an alternate peer
-      break;
-    }
-    default:{
-      printf("Received unknown packet type %d from %s:%d\n", 
-              type, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-      break;
+
+    switch(type){
+      case WHOHAS:{
+        int hash_num = (unsigned char) pkt->data[0];
+        printf("Received WHOHAS packet from %s:%d with %d hash(es)\n", 
+                inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
+        // TODO: For each hash in pkt->data, check if I (current peer) has 
+        // the corresponding chunk. if yes, prepare an IHAVE response and send it.
+        //(packet_t *pkt, struct sockaddr *from, socklen_t fromlen;
+                           //char *local_chunks, int sock
+        process_whohas_packet(pkt, &from, (config->has_chunk_file), sock);
+        break;
+      }
+      case IHAVE:{
+        int hash_num = (unsigned char) pkt->data[0];
+        printf("Received IHAVE packet from %s:%d with %d hash(es)\n", 
+                inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
+        // TODO: Update internal state to record which chunks the sender possesses.
+        // send GET as soon as I get "IHAVE" from a peer?
+        break;
+      }
+      case GET:{
+        printf("Received GET packet from %s:%d\n", 
+                inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+        // save the requested hash
+        unsigned char requested_hash[SHA1_HASH_SIZE];
+        memcpy(requested_hash, pkt->data, SHA1_HASH_SIZE);
+        // TODO: Check if I (current peer) have this chunk, if I have,
+        // start sending DATA packet for this chunk. if I do not have,
+        // send DENIED(? or should I ignore this)
+        break;
+      }
+      case DATA:{
+        uint32_t seq_num = ntohl(pkt->header.seq_num);
+        int data_len = recv_len - HEADERLEN;
+        printf("Received DATA packet (seq=%d) from %s:%d, data length=%d bytes\n", 
+                seq_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port), data_len);
+        // TODO: Process the received the data:
+        // save the data, update expecting chunks(sequence number?), 
+        // send ACK to the sender
+        break;
+      }
+      case ACK:{
+        uint32_t ack_num = ntohl(pkt->header.ack_num);
+        printf("Received ACK (ack=%d) from %s:%d\n", 
+                ack_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+        // TODO: Update sender("I", as in this peer) state:
+        // sliding window, update timer (not sure if there is more?)
+        break;
+      }
+      case DENIED:{
+        printf("Received DENIED from %s:%d\n", 
+                inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+      // TODO: Handle the denial
+      // mark the peer as unavailable (remove the peer from the list 
+      // of peers that has this chunk? we need data structure to keep
+      // track of this then)
+      // request the chunk from an alternate peer
+        break;
+      }
+      default:{
+        printf("Received unknown packet type %d from %s:%d\n", 
+                type, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+        break;
+      }
     }
   }
 }
 
 
-
-//Helper that further processes the chunkfile to obtain each chunk_hash
-chunk_t *process_chunkfile(char *chunkfile, int *num_chunks){
-  FILE *f;
-  char list_elem[LIST_ELEM_SIZE];
-
-  f = fopen(chunkfile, "r");
-  assert(f != NULL);
- 
-  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
-    (*num_chunks)++;        
-  }
-
-  printf("number of chunks function side : %d \n", (*num_chunks));
-  chunk_t *res = (chunk_t *)malloc((*num_chunks) * sizeof(chunk_t)); //to free
-
-  fseek(f, 0, SEEK_SET);
-  int curr = 0;
-  int id;
-  char hashbuf[20];
-
-  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
-    sscanf(list_elem, "%d %s", &id, hashbuf);
-    res[curr].id = id;
-    //binary2hex(hashbuf, 20, res[curr].hash);
-    binary2hex(res[curr].hash, 20, hashbuf);
-
-    curr++;
-
-   }
-  return res;
-}
-
-
-/**
- * make_packets
- * 
- * make packets
- * 
- */
-packet_t *make_packet (int type, short p_len, uint32_t seq, uint32_t ack, char *data){
-    packet_t *p = (packet_t *)malloc(sizeof(packet_t));
-    if (!p){
-      perror("Error alloc packet_t *p");
-      exit(EXIT_FAILURE);
-    }
-    fprintf(stderr, "[DEBUG] Allocating packet_t of size %lu\n", sizeof(packet_t));
-    p->header.magicnum = htons((short)15441); 
-    p->header.version = (char)1;
-    p->header.packet_type = (char) type;
-    p->header.header_len = htons((short)HEADERLEN);
-    p->header.packet_len = htons(p_len);
-    p->header.seq_num = htonl(seq);
-    p->header.ack_num = htonl(ack);
-    //if (p->data != NULL) 
-    if ((p_len - HEADERLEN) > DATALEN) {
-        fprintf(stderr, "Error: Attempting to copy too much data into packet\n");
-        exit(EXIT_FAILURE);
-    }
-    if (data != NULL) 
-        memcpy(p->data, data, p_len - HEADERLEN);
-    return p;
-}
 
 /**
  * make_whohas
@@ -305,23 +380,18 @@ packet_t **make_whohas (chunk_t *chunks, int num_chunks){
 
   for (int i = 0; i < num_packets; i++){
     int hash_num;
+
     // the number of hashes to put in this packet
-    /*if (i < (num_packets - 1)){
-      hash_num = MAX_HASH_NUM;
-    }else{
-      hash_num = (num_chunks % MAX_HASH_NUM == 0) ? MAX_HASH_NUM : num_chunks % MAX_HASH_NUM;
-    }*/
     hash_num = (i < (num_packets - 1)) ? MAX_HASH_NUM : 
                     (num_chunks % MAX_HASH_NUM ? num_chunks % MAX_HASH_NUM : MAX_HASH_NUM);
-    //char *data = malloc (4 + hash_num * SHA1_HASH_SIZE);
+
     //sanity check
     int data_size = 4 + hash_num * SHA1_HASH_SIZE;
     if (data_size > DATALEN) {
         fprintf(stderr, "Error: Data size exceeds DATALEN (%d > %d)\n", (4 + hash_num * SHA1_HASH_SIZE), DATALEN);
         exit(EXIT_FAILURE);
     }
-    fprintf(stderr, "[DEBUG] Allocating data of size %d\n", data_size);
-    char *data = malloc(4 + hash_num * SHA1_HASH_SIZE);;
+    char *data = malloc(4 + hash_num * SHA1_HASH_SIZE);
     if(!data){
       perror("Error alloc data");
       exit(EXIT_FAILURE);
@@ -333,6 +403,7 @@ packet_t **make_whohas (chunk_t *chunks, int num_chunks){
     //Put the chunk hashes into the packet data field
     for (int j = 0; j < hash_num; j++){
       memcpy(data + 4 + j * SHA1_HASH_SIZE, chunks[chunk_index].hash, SHA1_HASH_SIZE);
+      
       chunk_index++;
     }
     //create a whohas packet
@@ -467,7 +538,7 @@ void peer_run(bt_config_t *config) {
      
     if (nfds > 0) {
       if (FD_ISSET(sock, &readfds)) {
-        process_inbound_udp(sock);
+        process_inbound_udp(sock, config);
       }
        
       if (FD_ISSET(STDIN_FILENO, &readfds)) {
