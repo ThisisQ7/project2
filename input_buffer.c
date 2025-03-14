@@ -20,7 +20,7 @@ struct user_iobuf *create_userbuf() {
 }
 
 void process_user_input(int fd, struct user_iobuf *userbuf, 
-			void (*handle_line)(char *, void *), void *cbdata)
+			void (*handle_line)(char *, void *, bt_config_t *, int), void *cbdata, bt_config_t *config, int sock)
 {
   int nread;
   char *ret;
@@ -45,7 +45,7 @@ void process_user_input(int fd, struct user_iobuf *userbuf,
 
  while ((ret = strchr(userbuf->buf, '\n')) != NULL) {
   *ret = '\0';
-  handle_line(userbuf->buf, cbdata);
+  handle_line(userbuf->buf, cbdata, config, sock);
   /* Shift the remaining contents of the buffer forward */
   memmove(userbuf->buf, ret + 1, USERBUF_SIZE - (ret - userbuf->buf));
   userbuf->cur -= (ret - userbuf->buf + 1);
