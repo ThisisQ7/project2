@@ -96,24 +96,128 @@ int main(int argc, char **argv) {
   peer_run(&config);
   return 0;
 }
- 
- 
+
+/**
+ * packet_parse
+ * 
+ * 
+ * takes in a packet and check if the set headers are intact (maginum = 15441, version = 1, 
+ * packet type within the range of 0 to 5), if the packet is damaged/invalid, return -1, 
+ * if it is not, return the packet_type
+ * 
+ */
+int packet_parser(packet_t* pkt) {
+
+    
+  short magic = ntohs(pkt->header.magicnum);
+  if(magic != 15441){
+    printf ("Invalid magicnum: not 15441 \n");
+    return -1;
+  }
+  char version = pkt->header.version;
+  if(version != 1){
+    printf("Invalid version: not 1 \n");
+    return -1;
+  }
+  
+  int type = pkt->header.packet_type;
+  if(type < 0 || type > 5){
+    printf("packet_type out of range, packet_type %d \n", type);
+    return -1;
+  }
+  return type;
+}
+
 void process_inbound_udp(int sock) {
   struct sockaddr_in from;
   socklen_t fromlen;
   char buf[BUFLEN];
  
   fromlen = sizeof(from);
-  spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
- 
-  printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
-    "Incoming message from %s:%d\n%s\n\n", 
-    inet_ntoa(from.sin_addr),
-    ntohs(from.sin_port),
-    buf);
- }
- 
- //Helper that further processes the chunkfile to obtain each chunk_hash
+  int recv_len = spiffy_recvfrom(sock, buf, BUFLEN, 0, (struct sockaddr *) &from, &fromlen);
+  if(recv_len < HEADERLEN){
+    printf("Received packet shorter than HEADERLEN: %d bytes \n", recv_len);
+    return;
+  }
+
+  packet_t* pkt = (packet_t*) buf;
+  int type = packet_parser(pkt);
+  if (type == -1){
+    printf("something is wrong, check packet type \n");
+    return;
+  }
+  //printf("PROCESS_INBOUND_UDP SKELETON -- replace!\n"
+  //  "Incoming message from %s:%d\n%s\n\n", 
+  //  inet_ntoa(from.sin_addr),
+  //  ntohs(from.sin_port),
+  //  buf);
+  switch(type){
+    case WHOHAS:{
+      int hash_num = (unsigned char) pkt->data[0];
+      printf("Received WHOHAS packet from %s:%d with %d hash(es)\n", 
+              inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
+      // TODO: For each hash in pkt->data, check if I (current peer) has 
+      // the corresponding chunk. if yes, prepare an IHAVE response and send it.
+      break;
+    }
+    case IHAVE:{
+      int hash_num = (unsigned char) pkt->data[0];
+      printf("Received IHAVE packet from %s:%d with %d hash(es)\n", 
+              inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
+      // TODO: Update internal state to record which chunks the sender possesses.
+      // send GET as soon as I get "IHAVE" from a peer?
+      break;
+    }
+    case GET:{
+      printf("Received GET packet from %s:%d\n", 
+              inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+      // save the requested hash
+      unsigned char requested_hash[SHA1_HASH_SIZE];
+      memcpy(requested_hash, pkt->data, SHA1_HASH_SIZE);
+      // TODO: Check if I (current peer) have this chunk, if I have,
+      // start sending DATA packet for this chunk. if I do not have,
+      // send DENIED(? or should I ignore this)
+      break;
+    }
+    case DATA:{
+      uint32_t seq_num = ntohl(pkt->header.seq_num);
+      int data_len = recv_len - HEADERLEN;
+      printf("Received DATA packet (seq=%d) from %s:%d, data length=%d bytes\n", 
+              seq_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port), data_len);
+      // TODO: Process the received the data:
+      // save the data, update expecting chunks(sequence number?), 
+      // send ACK to the sender
+      break;
+    }
+    case ACK:{
+      uint32_t ack_num = ntohl(pkt->header.ack_num);
+      printf("Received ACK (ack=%d) from %s:%d\n", 
+              ack_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+      // TODO: Update sender("I", as in this peer) state:
+      // sliding window, update timer (not sure if there is more?)
+      break;
+    }
+    case DENIED:{
+      printf("Received DENIED from %s:%d\n", 
+              inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+    // TODO: Handle the denial
+    // mark the peer as unavailable (remove the peer from the list 
+    // of peers that has this chunk? we need data structure to keep
+    // track of this then)
+    // request the chunk from an alternate peer
+      break;
+    }
+    default:{
+      printf("Received unknown packet type %d from %s:%d\n", 
+              type, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+      break;
+    }
+  }
+}
+
+
+
+//Helper that further processes the chunkfile to obtain each chunk_hash
 chunk_t *process_chunkfile(char *chunkfile, int *num_chunks){
   FILE *f;
   char list_elem[LIST_ELEM_SIZE];
