@@ -44,10 +44,14 @@
 
 
 
- //==================================================
- //STRUCTS
+//==================================================
+//STRUCTS
 typedef struct chunk_s { 
   int id;
+  int requested; // 0 if no GET sent, 1 if GET already sent
+  int downloaded; //0 if not downloaded yet, 1 if already downloaded
+  //int peer_recorded; 0 if no peer recorded, 1 if already recorded
+  struct sockaddr_in* peer; // the peer that we will ask this chunk from
   uint8_t hash[SHA1_HASH_SIZE];
   char *data;
  } chunk_t;
@@ -67,8 +71,14 @@ typedef struct packet_s {
   char data[DATALEN];
  } packet_t;
   
+//===========================================
+//GLOBAL VARIABLE
 
- //===========================================
+// Global array and counter for requested chunks.
+chunk_t *requested_chunks = NULL;
+int requested_num = 0;
+
+//===========================================
  
 void peer_run(bt_config_t *config);
  
@@ -126,8 +136,10 @@ packet_t *make_packet (int type, short p_len, uint32_t seq, uint32_t ack, char *
     return p;
 }
 
-//Helper that further processes the chunkfile to obtain each chunk_hash
-chunk_t *process_chunkfile(char *chunkfile, int *num_chunks){
+// Helper that further processes the chunkfile to obtain each chunk_hash
+// chunks I want to request, have = 0
+// chunks I have, have = 1 
+chunk_t *process_chunkfile(char *chunkfile, int *num_chunks, int have){
   FILE *f;
   char list_elem[LIST_ELEM_SIZE];
 
@@ -146,15 +158,32 @@ chunk_t *process_chunkfile(char *chunkfile, int *num_chunks){
   int id;
   char hashbuf[40];
 
-  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
-    sscanf(list_elem, "%d %s", &id, hashbuf);
-    res[curr].id = id;
-    hex2binary(hashbuf, 40, res[curr].hash);
-    //binary2hex(res[curr].hash, 20, hashbuf);
-    
-    curr++;
+  if (have == 0){
+    while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
+      sscanf(list_elem, "%d %s", &id, hashbuf);
+      res[curr].id = -1;
+      hex2binary(hashbuf, 40, res[curr].hash);
+      //binary2hex(res[curr].hash, 20, hashbuf);
+      res[curr].peer = NULL;
+      res[curr].requested = 0;
+      res[curr].downloaded = 0;
+      curr++;
+     }
+    requested_chunks = res;
+    requested_num = (*num_chunks);
+  } else{
+    while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
+      sscanf(list_elem, "%d %s", &id, hashbuf);
+      res[curr].id = id;
+      hex2binary(hashbuf, 40, res[curr].hash);
+      //binary2hex(res[curr].hash, 20, hashbuf);
+      res[curr].peer = NULL;
+      res[curr].requested = 0;
+      res[curr].downloaded = 1;
+      curr++;
+     }
+  }
 
-   }
   return res;
 }
 
@@ -190,76 +219,81 @@ int packet_parser(packet_t* pkt) {
   return type;
 }
 
+/**
+ * process_whohas_packet
+ * 
+ * Process an incoming WHOHAS packet. The function extracts the number of requested hashes, 
+ * checks which do I(this peer) have, and if any are found, constructs and sends an IHAVE packet.
+ * 
+ */
+void process_whohas_packet(packet_t *pkt, struct sockaddr_in *from, char *haschunk, int sock) {
 
-void process_whohas_packet(packet_t *pkt, struct sockaddr_in *from, 
-                           char *haschunk, int sock) {
-
-    int num_local = 0;
-    chunk_t *local_chunks = process_chunkfile(haschunk, &num_local);
-    int hash_count = (unsigned char) pkt->data[0];
-    printf("Processing WHOHAS packet: %d hash(es) requested\n", hash_count);
+  int num_local = 0;
+  chunk_t *local_chunks = process_chunkfile(haschunk, &num_local, 1);
+  int hash_count = (unsigned char) pkt->data[0];
+  printf("Processing WHOHAS packet: %d hash(es) requested\n", hash_count);
+  
+  unsigned char *available_hashes = malloc(hash_count * SHA1_HASH_SIZE);
+  if (!available_hashes) {
+    perror("malloc available_hashes failed");
+    exit(EXIT_FAILURE);
+  }
+  int available_count = 0;
     
-    unsigned char *available_hashes = malloc(hash_count * SHA1_HASH_SIZE);
-    if (!available_hashes) {
-        perror("malloc available_hashes failed");
-        exit(EXIT_FAILURE);
+  // Iterate over each hash in the WHOHAS packet.
+  for (int i = 0; i < hash_count; i++) {
+    int offset = 4 + i * SHA1_HASH_SIZE;
+    unsigned char *current_hash = (unsigned char *) pkt->data + offset;
+      
+    // Check if this hash matches any chunk in our local chunk list.
+    for (int j = 0; j < num_local; j++) {
+      if (memcmp(current_hash, local_chunks[j].hash, SHA1_HASH_SIZE) == 0) {
+      // Match found: copy the hash into our available list.
+      memcpy(available_hashes + available_count * SHA1_HASH_SIZE,
+              current_hash, SHA1_HASH_SIZE);
+      available_count++;
+      break; // No need to check other local chunks for this hash.
+      }
     }
-    int available_count = 0;
+  }
     
-    // Iterate over each hash in the WHOHAS packet.
-    for (int i = 0; i < hash_count; i++) {
-        int offset = 4 + i * SHA1_HASH_SIZE;
-        unsigned char *current_hash = (unsigned char *) pkt->data + offset;
-        
-        // Check if this hash matches any chunk in our local chunk list.
-        for (int j = 0; j < num_local; j++) {
-            
-            if (memcmp(current_hash, local_chunks[j].hash, SHA1_HASH_SIZE) == 0) {
-                // Match found: copy the hash into our available list.
-                memcpy(available_hashes + available_count * SHA1_HASH_SIZE,
-                       current_hash, SHA1_HASH_SIZE);
-                available_count++;
-                break; // No need to check other local chunks for this hash.
-            }
-        }
+  // If any matching chunks were found, send an IHAVE response.
+  if (available_count > 0) {
+    printf("available_count: %d \n", available_count);
+    int ihave_data_size = 4 + available_count * SHA1_HASH_SIZE;
+    char *ihave_data = malloc(ihave_data_size);
+    if (!ihave_data) {
+      perror("malloc ihave_data failed");
+      exit(EXIT_FAILURE);
     }
-    
-    // If any matching chunks were found, send an IHAVE response.
-    if (available_count > 0) {
-        printf("available_count: %d \n", available_count);
-        int ihave_data_size = 4 + available_count * SHA1_HASH_SIZE;
-        char *ihave_data = malloc(ihave_data_size);
-        if (!ihave_data) {
-            perror("malloc ihave_data failed");
-            exit(EXIT_FAILURE);
-        }
-        memset(ihave_data, 0, ihave_data_size);
-        ihave_data[0] = (char) available_count;
+    memset(ihave_data, 0, ihave_data_size);
+    ihave_data[0] = (char) available_count;
         
-        // Copy each matching hash into the payload after the first 4 bytes.
-        for (int i = 0; i < available_count; i++) {
-            memcpy(ihave_data + 4 + i * SHA1_HASH_SIZE,
-                   available_hashes + i * SHA1_HASH_SIZE, SHA1_HASH_SIZE);
-        }
+    // Copy each matching hash into the payload after the first 4 bytes.
+    for (int i = 0; i < available_count; i++) {
+      memcpy(ihave_data + 4 + i * SHA1_HASH_SIZE,
+             available_hashes + i * SHA1_HASH_SIZE, SHA1_HASH_SIZE);
+    }
                 
-        // Create the IHAVE packet. 
-        packet_t *ihave_pkt = make_packet(IHAVE, HEADERLEN + ihave_data_size, 0, 0, ihave_data);
-        
-        // Send the IHAVE packet back to the from.
-        spiffy_sendto(sock, ihave_pkt, sizeof(packet_t), 0,
-                      (struct sockaddr *)from, sizeof(*from));
-        printf("Sent IHAVE packet with %d hash(es) to %s:%d\n", available_count,
-               inet_ntoa(from->sin_addr), ntohs(from->sin_port));
-        
-        free(ihave_pkt);
-        free(ihave_data);
-    } else {
-        printf("No matching chunks found for WHOHAS request from %s:%d\n",
-               inet_ntoa(from->sin_addr), ntohs(from->sin_port));
-    }
+    // Create the IHAVE packet. 
+    packet_t *ihave_pkt = make_packet(IHAVE, HEADERLEN + ihave_data_size, 0, 0, ihave_data);
     
-    free(available_hashes);
+    // Send the IHAVE packet back to the from.
+    spiffy_sendto(sock, ihave_pkt, sizeof(packet_t), 0,
+                  (struct sockaddr *)from, sizeof(*from));
+    printf("Sent IHAVE packet with %d hash(es) to %s:%d\n", available_count,
+           inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+        
+    free(ihave_pkt);
+    free(ihave_data);
+  } else {
+    printf("No matching chunks found for WHOHAS request from %s:%d\n",
+           inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+  }
+    
+  free(available_hashes);
 }
+
 
 void process_inbound_udp(int sock, bt_config_t *config) {
   struct sockaddr_in from;
@@ -290,10 +324,6 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         int hash_num = (unsigned char) pkt->data[0];
         printf("Received WHOHAS packet from %s:%d with %d hash(es)\n", 
                 inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
-        // TODO: For each hash in pkt->data, check if I (current peer) has 
-        // the corresponding chunk. if yes, prepare an IHAVE response and send it.
-        //(packet_t *pkt, struct sockaddr *from, socklen_t fromlen;
-                           //char *local_chunks, int sock
         process_whohas_packet(pkt, &from, (config->has_chunk_file), sock);
         break;
       }
@@ -303,6 +333,50 @@ void process_inbound_udp(int sock, bt_config_t *config) {
                 inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
         // TODO: Update internal state to record which chunks the sender possesses.
         // send GET as soon as I get "IHAVE" from a peer?
+        // Iterate over each hash provided in the IHAVE packet
+          for (int i = 0; i < hash_num; i++) {
+              int offset = 4 + i * SHA1_HASH_SIZE;
+              unsigned char *ihave_hash = (unsigned char *) pkt->data + offset;
+              
+              // For each requested chunk, check if the hash matches
+              for (int j = 0; j < requested_num; j++) {
+                  // If the chunk is not yet downloaded and not already requested
+                  if (requested_chunks[j].downloaded == 0 && requested_chunks[j].requested == 0) {
+                      if (memcmp(ihave_hash, requested_chunks[j].hash, SHA1_HASH_SIZE) == 0) {
+                          // Update the chunk's peer information with the sender's address
+                          if (requested_chunks[j].peer == NULL) {
+                              requested_chunks[j].peer = malloc(sizeof(struct sockaddr_in));
+                              if (requested_chunks[j].peer == NULL) {
+                                  perror("malloc for peer failed");
+                                  exit(EXIT_FAILURE);
+                              }
+                          }
+                          memcpy(requested_chunks[j].peer, &from, sizeof(struct sockaddr_in));
+                          
+                          // Mark this chunk as having been requested
+                          requested_chunks[j].requested = 1;
+                          
+                          // Create a GET packet with the chunk hash as payload
+                          packet_t *get_pkt = make_packet(GET, HEADERLEN + SHA1_HASH_SIZE, 0, 0, (char *)ihave_hash);
+                          
+                          // Send the GET packet to the peer that sent the IHAVE
+                          spiffy_sendto(sock, get_pkt, sizeof(packet_t), 0, (struct sockaddr *) &from, sizeof(from));
+                          
+                          // (Optional) For debugging: print out the hash in hexadecimal format.
+                          char hash_hex[SHA1_HASH_SIZE*2+1];
+                          binary2hex(ihave_hash, SHA1_HASH_SIZE, hash_hex);
+                          printf("Sent GET for chunk with hash %s to %s:%d\n", hash_hex,
+                                 inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+                          
+                          free(get_pkt);
+                          
+                          // Once we have processed a matching chunk, break out of the inner loop.
+                          break;
+                      }
+                  }
+              }
+          }
+
         break;
       }
       case GET:{
@@ -478,7 +552,7 @@ void process_get(char *chunkfile, char *outputfile, bt_config_t *config, int soc
   //First, we access the chunks the user wishses to obtain
   int num_chunks = 0;
   chunk_t *chunk_list;
-  chunk_list = process_chunkfile(chunkfile, &num_chunks);
+  chunk_list = process_chunkfile(chunkfile, &num_chunks, 0);
 
   printf("number of chunks on the caller side : %d \n", num_chunks);
 
