@@ -9,20 +9,20 @@
  *
  */
 
- #include <sys/types.h>
- #include <arpa/inet.h>
- #include <sys/socket.h>
- #include <netinet/in.h>
- #include <stdio.h>
- #include <stdlib.h>
- #include <string.h>
- #include "debug.h"
- #include "spiffy.h"
- #include "bt_parse.h"
- #include "input_buffer.h"
- #include "chunk.h"
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "debug.h"
+#include "spiffy.h"
+#include "bt_parse.h"
+#include "input_buffer.h"
+#include "chunk.h"
  
- #include <assert.h>
+#include <assert.h>
  
 
 #define PACKETLEN 1500
@@ -33,7 +33,7 @@
 #define MAX_HASH_NUM 74
 #define SHA1_HASH_SIZE 20
 #define LIST_ELEM_SIZE 52
-
+#define CHUNK_SIZE 512*1024
 
 #define WHOHAS 0
 #define IHAVE 1
@@ -70,13 +70,33 @@ typedef struct packet_s {
   header_t header;
   char data[DATALEN];
  } packet_t;
-  
+
+typedef struct connection_state {
+    struct sockaddr_in addr;
+    uint32_t expected_seq;
+    char *data_buffer;
+    size_t data_offset;
+    size_t chunk_size;
+    struct connection_state *next; 
+
+} connection_state_t;
+
+typedef struct {
+  int last_packet_acked;
+  int last_packet_sent;
+  int last_packet_available;
+  packet_t *window[WINDOW_SIZE]; // Buffer for sent but unacknowledged packets
+  struct timeval timers[WINDOW_SIZE]; 
+} sender_state_t;
+
 //===========================================
 //GLOBAL VARIABLE
 
 // Global array and counter for requested chunks.
 chunk_t *requested_chunks = NULL;
 int requested_num = 0;
+//Global state of existing state, linked list
+connection_state_t *conn_states = NULL;
 
 //===========================================
  
@@ -187,6 +207,158 @@ chunk_t *process_chunkfile(char *chunkfile, int *num_chunks, int have){
   return res;
 }
 
+//helper function to look up chunkhash id
+ int lookup_id(FILE *f, char *buf){
+  char list_elem[LIST_ELEM_SIZE];
+  char hash[40];
+  int id;
+
+  printf("buf : %s\n", buf);
+  while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL){
+    sscanf(list_elem, "%d %s", &id, hash);
+    printf("hash : %s\n", hash);
+
+    if (strcmp(hash, buf) == 0){
+      printf("id from lookup_id: %d\n", id);
+      return id;
+    }
+  } 
+  
+  return -1;
+ }
+
+ //Get handler: looks at chunk hash, looks up it's position within the master-chunk-file.
+ // Based on the hash's file id, we displace a certain chunk distance and start sequentializing the chunk
+
+ void get_handler(char *msg, struct sockaddr_in from, bt_config_t *config, int sock){
+  printf("Here is the master chunk file %s\n", config->chunk_file);
+
+  char buf[40];
+  binary2hex(msg, 20, buf);
+
+  FILE *f;
+  char list_elem[LIST_ELEM_SIZE];
+  char master_data_file[100];
+  f = fopen(config->chunk_file, "r");  
+
+  fgets(list_elem, LIST_ELEM_SIZE, f);
+  sscanf(list_elem, "File: %s\n", master_data_file);
+  printf("%s\n", master_data_file);  
+  fseek(f, 0, SEEK_SET);
+
+  int id = lookup_id(f, buf);
+
+  fclose(f);
+
+  FILE* dataFile = fopen(master_data_file, "r");
+
+  // get_data_packet_data(f, )
+  // while(fgets(list_elem, LIST_ELEM_SIZE, f) != NULL){
+  //   printf("%s\n", list_elem);
+  // }
+  if (!dataFile) {
+        perror("Failed to open master data file");
+        return;
+    }
+
+  // Constants: each chunk is 512KB, and each DATA packet carries up to DATALEN bytes.
+  //const int CHUNK_SIZE = 512 * 1024;  // 512 KB
+  int payload_size = DATALEN;     // typically 1484 bytes per DATA packet
+  int total_packets = (CHUNK_SIZE + payload_size - 1) / payload_size;
+
+  // Seek to the correct offset in the master data file.
+  long offset = id * CHUNK_SIZE;
+  if (fseek(dataFile, offset, SEEK_SET) != 0) {
+      perror("Failed to seek to the chunk offset in master data file");
+      fclose(dataFile);
+      return;
+  }
+
+  // Allocate a buffer for one chunk.
+  char *chunk_buffer = malloc(CHUNK_SIZE);
+  if (!chunk_buffer) {
+    perror("Failed to allocate memory for chunk data");
+    fclose(dataFile);
+    return;
+  }
+
+  // Read the entire chunk into memory.
+  size_t bytes_read = fread(chunk_buffer, 1, CHUNK_SIZE, dataFile);
+  if (bytes_read != CHUNK_SIZE) {
+    fprintf(stderr, "Warning: Expected to read %d bytes, but read %zu bytes\n", CHUNK_SIZE, bytes_read);
+  }
+  fclose(dataFile);
+
+  // For checkpoint 1, fixed window size 8 packets.
+  int window_size = 8;
+  uint32_t seq_num = 1;
+
+  // Variables to track the sending window.
+  int next_packet = 0;  // index of the next packet to send
+  // In a complete implementation, you’d also track ACKs and set timers for retransmission.
+
+  // Loop over the chunk and send DATA packets.
+  while (next_packet < total_packets) {
+    // Send packets within the window.
+    for (int i = 0; i < window_size && next_packet < total_packets; i++, next_packet++) {
+      int offset_in_chunk = next_packet * payload_size;
+      int current_payload = (CHUNK_SIZE - offset_in_chunk) < payload_size ? (CHUNK_SIZE - offset_in_chunk) : payload_size;
+
+      // Create a DATA packet for this segment.
+      packet_t *data_pkt = make_packet(DATA, HEADERLEN + current_payload, seq_num, 0, chunk_buffer + offset_in_chunk);
+      // Send the DATA packet to the requester.
+      spiffy_sendto(sock, data_pkt, HEADERLEN + current_payload, 0, (struct sockaddr *) &from, sizeof(from));
+      printf("Sent DATA packet seq %d (chunk id %d) to %s:%d\n", seq_num, id,
+             inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+
+      // In a full reliable implementation, start a timer for this packet here.
+      free(data_pkt);
+      seq_num++;
+    }
+
+  }
+  free(chunk_buffer);
+}
+
+connection_state_t *get_connection_state(struct sockaddr_in *from) {
+    connection_state_t *curr = conn_states;
+    
+    // Search for an existing connection state that matches the sender's address.
+    while (curr != NULL) {
+        if ((curr->addr.sin_addr.s_addr == from->sin_addr.s_addr)
+            && (curr->addr.sin_port == from->sin_port )) {
+            return curr;
+        }
+        curr = curr->next;
+    }
+    
+    // No existing state found; allocate a new connection state.
+    connection_state_t *new_state = malloc(sizeof(connection_state_t));
+    if (!new_state) {
+        perror("malloc for connection_state failed");
+        return NULL;
+    }
+    
+    // Copy the sender's address.
+    new_state->addr = *from;
+    new_state->expected_seq = 1;   // Start with sequence number 1.
+    new_state->data_offset = 0;
+    new_state->chunk_size = CHUNK_SIZE;
+    
+    // Allocate the buffer for the incoming chunk data.
+    new_state->data_buffer = malloc(new_state->chunk_size);
+    if (!new_state->data_buffer) {
+        perror("malloc for data_buffer failed");
+        free(new_state);
+        return NULL;
+    }
+    
+    // Insert the new connection state at the beginning of the global list.
+    new_state->next = conn_states;
+    conn_states = new_state;
+    
+    return new_state;
+}
 
 /**
  * packet_parse
@@ -239,7 +411,7 @@ void process_whohas_packet(packet_t *pkt, struct sockaddr_in *from, char *haschu
     exit(EXIT_FAILURE);
   }
   int available_count = 0;
-    
+  
   // Iterate over each hash in the WHOHAS packet.
   for (int i = 0; i < hash_count; i++) {
     int offset = 4 + i * SHA1_HASH_SIZE;
@@ -331,8 +503,7 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         int hash_num = (unsigned char) pkt->data[0];
         printf("Received IHAVE packet from %s:%d with %d hash(es)\n", 
                 inet_ntoa(from.sin_addr), ntohs(from.sin_port), hash_num);
-        // TODO: Update internal state to record which chunks the sender possesses.
-        // send GET as soon as I get "IHAVE" from a peer?
+
         // Iterate over each hash provided in the IHAVE packet
           for (int i = 0; i < hash_num; i++) {
               int offset = 4 + i * SHA1_HASH_SIZE;
@@ -353,24 +524,21 @@ void process_inbound_udp(int sock, bt_config_t *config) {
                           }
                           memcpy(requested_chunks[j].peer, &from, sizeof(struct sockaddr_in));
                           
-                          // Mark this chunk as having been requested
+                          // Mark this chunk as requested
                           requested_chunks[j].requested = 1;
                           
                           // Create a GET packet with the chunk hash as payload
                           packet_t *get_pkt = make_packet(GET, HEADERLEN + SHA1_HASH_SIZE, 0, 0, (char *)ihave_hash);
-                          
-                          // Send the GET packet to the peer that sent the IHAVE
                           spiffy_sendto(sock, get_pkt, sizeof(packet_t), 0, (struct sockaddr *) &from, sizeof(from));
                           
-                          // (Optional) For debugging: print out the hash in hexadecimal format.
+                          // FOR DEBUGGING: print out the hash in hexadecimal format.
                           char hash_hex[SHA1_HASH_SIZE*2+1];
                           binary2hex(ihave_hash, SHA1_HASH_SIZE, hash_hex);
                           printf("Sent GET for chunk with hash %s to %s:%d\n", hash_hex,
                                  inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-                          
+
                           free(get_pkt);
                           
-                          // Once we have processed a matching chunk, break out of the inner loop.
                           break;
                       }
                   }
@@ -388,6 +556,8 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         // TODO: Check if I (current peer) have this chunk, if I have,
         // start sending DATA packet for this chunk. if I do not have,
         // send DENIED(? or should I ignore this)
+        get_handler(pkt->data, from, config, sock);
+
         break;
       }
       case DATA:{
@@ -398,6 +568,40 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         // TODO: Process the received the data:
         // save the data, update expecting chunks(sequence number?), 
         // send ACK to the sender
+        connection_state_t *conn = get_connection_state(&from);
+        if (!conn) {
+          fprintf(stderr, "Failed to get connection state for sender %s:%d\n",
+                  inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+          break;
+        }
+
+        // Process the DATA packet.
+        if (seq_num == conn->expected_seq) {
+          // Append the received data into the buffer.
+          memcpy(conn->data_buffer + conn->data_offset, pkt->data, data_len);
+          conn->data_offset += data_len;
+          conn->expected_seq++;  // Expect the next sequence number.
+
+          // DEBUG PURPOSE
+          if (conn->data_offset >= conn->chunk_size) {
+            printf("Chunk fully received from %s:%d\n", 
+                   inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            // TODO: Finalize the transfer (write buffer to file, free connection state)
+          }
+        } else if (seq_num > conn->expected_seq) {
+          // Out-of-order packet: could buffer for later reordering.
+          printf("Out-of-order DATA packet: expected %d, got %d\n", conn->expected_seq, seq_num);
+        } else {
+          // Duplicate packet
+          printf("Duplicate DATA packet: seq %d already received, ignoring.\n", seq_num);
+        }
+
+        // Send cumulative ACK
+        uint32_t ack_num = conn->expected_seq - 1;
+        packet_t *ack_pkt = make_packet(ACK, HEADERLEN, 0, ack_num, NULL);
+        spiffy_sendto(sock, ack_pkt, HEADERLEN, 0, (struct sockaddr *)&from, sizeof(from));
+        printf("Sent ACK with ack=%d to %s:%d\n", ack_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+        free(ack_pkt);
         break;
       }
       case ACK:{
@@ -415,7 +619,8 @@ void process_inbound_udp(int sock, bt_config_t *config) {
       // mark the peer as unavailable (remove the peer from the list 
       // of peers that has this chunk? we need data structure to keep
       // track of this then)
-      // request the chunk from an alternate peer
+      // request the chunk from an alternate peer?
+      // RELATED TO CONGESTION CONTROL, CHECKPOINT 2
         break;
       }
       default:{
