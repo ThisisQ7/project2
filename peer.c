@@ -761,7 +761,7 @@ int peer_available(struct sockaddr_in* peer) {
  * frees its allocated resources, and then returns.
  *
  */
-void remove_connection_state(struct sockaddr_in *peer) {
+void remove_connection(struct sockaddr_in *peer) {
     connection_state_t *prev = NULL;
     connection_state_t *curr = conn_states;
 
