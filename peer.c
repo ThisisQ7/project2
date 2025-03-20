@@ -732,8 +732,14 @@ void get_handler(char *msg, struct sockaddr_in from, bt_config_t *config) {
   start_data_transmission(master_data_file, id, from, config);
 }
 
-// Helper: determine if a peer is available to handle a download.
-// For now, assume every peer is available.
+/**
+ * peer_available
+ * 
+ * Determine if a peer is available to handle a download by going through the list of 
+ * connection states
+ * 
+ */
+
 int peer_available(struct sockaddr_in* peer) {
   connection_state_t *curr = conn_states;
     while (curr != NULL) {
@@ -755,20 +761,26 @@ int peer_available(struct sockaddr_in* peer) {
  * frees its allocated resources, and then returns.
  *
  */
-void remove_connection(struct sockaddr_in *peer) {
-    connection_state_t **indirect = &conn_states;
-    while (*indirect != NULL) {
-        if ((*indirect)->addr.sin_addr.s_addr == peer->sin_addr.s_addr &&
-            (*indirect)->addr.sin_port == peer->sin_port) {
-            connection_state_t *to_delete = *indirect;
-            *indirect = to_delete->next;
-            free(to_delete->data_buffer);
-            free(to_delete);
+void remove_connection_state(struct sockaddr_in *peer) {
+    connection_state_t *prev = NULL;
+    connection_state_t *curr = conn_states;
+
+    while (curr != NULL) {
+        if (curr->addr.sin_addr.s_addr == peer->sin_addr.s_addr &&
+            curr->addr.sin_port == peer->sin_port) {
+            if (prev == NULL) {
+                conn_states = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+            free(curr->data_buffer);
+            free(curr);
             printf("Removed connection state for peer %s:%d\n",
                    inet_ntoa(peer->sin_addr), ntohs(peer->sin_port));
             return;
         }
-        indirect = &((*indirect)->next);
+        prev = curr;
+        curr = curr->next;
     }
 }
 
