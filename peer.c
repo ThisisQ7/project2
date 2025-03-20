@@ -445,7 +445,7 @@ void process_inbound_udp(int sock, bt_config_t *config) {
           if (conn->data_offset >= conn->chunk_size) {
             printf("Chunk fully received from %s:%d\n",
                    inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-            //remove_connection_state(&from);
+            //remove_connection(&from);
           }
         } else if (seq_num > conn->expected_seq) {
           printf("Out-of-order DATA packet: expected %d, got %d\n", conn->expected_seq, seq_num);
@@ -748,13 +748,37 @@ int peer_available(struct sockaddr_in* peer) {
 }
 
 /**
- * download_chunk - Initiate GET requests for pending chunks.
+ * remove_connection
+ * 
+ * Remove and free the connection state for a given peer by Searching the global connection state 
+ * list for a connection state matching the given peer, removes it from the list, 
+ * frees its allocated resources, and then returns.
  *
- * Iterates over global requested_chunks. For each chunk not yet downloaded or requested
- * with a non-empty peer list, it finds an available peer and sends a GET
- * packet using the chunk's hash, then marks the chunk as requested.
- *
- * @param sock  UDP socket used to send GET packets.
+ */
+void remove_connection(struct sockaddr_in *peer) {
+    connection_state_t **indirect = &conn_states;
+    while (*indirect != NULL) {
+        if ((*indirect)->addr.sin_addr.s_addr == peer->sin_addr.s_addr &&
+            (*indirect)->addr.sin_port == peer->sin_port) {
+            connection_state_t *to_delete = *indirect;
+            *indirect = to_delete->next;
+            free(to_delete->data_buffer);
+            free(to_delete);
+            printf("Removed connection state for peer %s:%d\n",
+                   inet_ntoa(peer->sin_addr), ntohs(peer->sin_port));
+            return;
+        }
+        indirect = &((*indirect)->next);
+    }
+}
+
+/**
+ * download_chunk 
+ * 
+ * Initiate GET requests for pending chunks. Iterates over global requested_chunks. 
+ * For each chunk not yet downloaded or requested with a non-empty peer list, find an available 
+ * peer and sends a GET packet using the chunk's hash, then marks the chunk as requested.
+ * 
  */
 void download_chunk(int sock) {
   //printf("Entered download_chunk!\n");
