@@ -60,7 +60,7 @@ int spiffy_recvfrom (int socket, void *buffer, size_t size, int flags, struct so
         local_fromlen = sizeof(struct sockaddr_in);
 
 	if (!giSpiffyEnabled) {
-		printf("Spiffy not enabled, using normal recvfrom\n");
+		// printf("Spiffy not enabled, using normal recvfrom\n");
 		return recvfrom(socket, buffer, size, flags, addr, lengthPtr);
 	}
 
@@ -111,7 +111,8 @@ int spiffy_init (long lNodeID, const struct sockaddr *addr, socklen_t addrlen) {
 	  fprintf(stderr, "Must be an IP address.  127.0.0.1:port would be a nice format.\n");
 	  return -1;
 	}
-	giSpiffyEnabled = 1;
+	//commented out for easier manual testing
+	giSpiffyEnabled = 1; 
 	glNodeID = lNodeID;
 
 	glSrcAddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;

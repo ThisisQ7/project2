@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include "bt_parse.h"
 #include "debug.h"
+#include <getopt.h>
 
 static const char* const _bt_optstring = "p:c:f:m:i:d:h";
 
@@ -50,6 +51,7 @@ void bt_help() {
 	  );
 }
 
+//bt_peer_info simply fetches a peer from the config struct, based on peer_id
 bt_peer_t *bt_peer_info(const bt_config_t *config, int peer_id)
 {
   assert(config != NULL);
@@ -105,7 +107,7 @@ void bt_parse_command_line(bt_config_t *config) {
     }
   }
 
-  bt_parse_peer_list(config);
+  bt_parse_peer_list(config); //*
 
   if (config->identity == 0) {
     fprintf(stderr, "bt_parse error:  Node identity must not be zero!\n");
@@ -124,6 +126,7 @@ void bt_parse_command_line(bt_config_t *config) {
   optind = old_optind;
 }
 
+//*
 void bt_parse_peer_list(bt_config_t *config) {
   FILE *f;
   bt_peer_t *node;
@@ -147,10 +150,12 @@ void bt_parse_peer_list(bt_config_t *config) {
 
     host = gethostbyname(hostname);
     assert(host != NULL);
-    node->addr.sin_addr.s_addr = *(in_addr_t *)host->h_addr;
+    node->addr.sin_addr.s_addr = *(in_addr_t *)host->h_addr_list[0];
     node->addr.sin_family = AF_INET;
     node->addr.sin_port = htons(port);
 
+    //building backwards, from NULL? I'm assuming that 
+    //this is how we construct our node view from our peer
     node->next = config->peers;
     config->peers = node;
   }

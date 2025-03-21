@@ -1,3 +1,11 @@
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #define PACKETLEN 1500
 #define BUFLEN 100
 #define HEADERLEN 16
@@ -23,18 +31,24 @@ typedef struct header_s {
     uint32_t ack_num;
 } header_t;  
 
-typedef struct data_packet {
+typedef struct packet_s {
     header_t header;
     char data[BUFLEN];
-} data_packet_t;
+} packet_t;
 
 typedef struct chunk_s { 
   int id;
-  uint32_t hash[SHA1_HASH_SIZE];
+  uint8_t hash[SHA1_HASH_SIZE];
   char *data;
 } chunk_t;
 
 
+/**
+ * make_packets
+ * 
+ * make packets
+ * 
+ */
 data_packet_t *make_packet (int type, short p_len, uint32_t seq, uint32_t ack, char *data){
     data_packet_t *p = (data_packet_t *)malloc(sizeof(data_packet_t));
     p->header.magicnum = 15441; 
@@ -49,7 +63,14 @@ data_packet_t *make_packet (int type, short p_len, uint32_t seq, uint32_t ack, c
     return p;
 }
 
-
+/**
+ * make_whohas
+ * 
+ * make a list of whohas packets with input of chunks we are 
+ * trying to request, the number of chunks (size of chunks array)
+ * is num_chunks
+ * 
+ */
 
 data_packet_t **make_whohas (chunk_t *chunks, int num_chunks){
   int num_packets = num_chunks / MAX_HASH_NUM;
@@ -94,3 +115,43 @@ data_packet_t **make_whohas (chunk_t *chunks, int num_chunks){
   }
   return whohas_packets;
 }
+
+
+/**
+ * flood_whohas
+ * 
+ * flood WHOHAS packet to every peer in the network
+ * 
+ */
+
+ void flood_whohas(){
+  
+ }
+
+/**
+ * send_whohas
+ * 
+ * make whohas packets
+ * 
+ */
+void send_whohas(chunk_t chunks, int num_chunks){
+  printf("ENTER FLOOD_WHOHAS\n");
+  data_packet_t whohas_packets = make_whohas(chunks, num_chunks);
+  if (!whohas_packets){
+    perror("Error making whohas_packet");
+    exit(EXIT_FAILURE);
+  }
+  int num_packets = num_chunks / MAX_HASH_NUM;
+  if (num_chunks % MAX_HASH_NUM > 0)
+    num_packets++;
+
+  //send each WHOHAS packet
+  for (int i = 0; i < num_packets; i++){
+    if(whohas_packets[i] == NULL)
+      continue;
+    flood_whohas(whohas_packets[i]); //flood this packet to every peer
+    packet_free(whohas_packets[i]);
+  }
+  free(whohas_packets);
+}
+
