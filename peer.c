@@ -125,6 +125,7 @@ typedef struct sender_state{
   size_t data_offset;
   size_t chunk_size;
   int chunk_id;
+  int flow_id;
   packet_t **window;          // Dynamically allocated window buffer
   struct timeval *timers;     // Dynamically allocated timers array
   int dup_ack_count;
@@ -151,7 +152,7 @@ connection_state_t *conn_states = NULL;
 
 /* Global socket variable so that DATA and congestion-control routines can use it. */
 int sock;
-
+struct timeval program_start_time;
 
 
 /*==================================================*/
@@ -345,6 +346,19 @@ void window_init(sender_state_t *sender) {
   
   // Allocate the window buffer
   allocate_window_buffer(sender, initial_buffer_size);
+  // Make sure the log file is properly opened
+  if (sender->window_log == NULL) {
+    sender->window_log = fopen("problem2-peer.txt", "a");
+    if (sender->window_log == NULL) {
+      perror("Failed to open window size log file");
+      // Continue without logging
+    }
+  }
+}
+
+int get_unique_flow_id() {
+  static int next_flow_id = 1;
+  return next_flow_id++;
 }
 
 /* Update free_window to handle the dynamic allocation */
@@ -479,15 +493,20 @@ void log_window_size(sender_state_t *state) {
     if (state->window_log) {
         struct timeval now;
         gettimeofday(&now, NULL);
-        long elapsed_ms = (now.tv_sec - state->start_time.tv_sec) * 1000 + 
-                         (now.tv_usec - state->start_time.tv_usec) / 1000;
+        long elapsed_ms = (now.tv_sec - program_start_time.tv_sec) * 1000 + 
+                         (now.tv_usec - program_start_time.tv_usec) / 1000;
+        //long elapsed_ms = (now.tv_sec - state->start_time.tv_sec) * 1000 + 
+        //                 (now.tv_usec - state->start_time.tv_usec) / 1000;
         
         // Use the peer's address as a unique flow identifier
         fprintf(state->window_log, "f%d\t%ld\t%d\n", 
-                ntohs(state->addr.sin_port), elapsed_ms, state->window_size);
+                state->flow_id, 
+                elapsed_ms, 
+                state->window_size);
         fflush(state->window_log);
     }
 }
+
 void free_sender_state(sender_state_t *state) {
     if (state) {
         // Close the window log file if open
@@ -513,6 +532,7 @@ void clear_sender_state(sender_state_t *state) {
     // Close the window log file if open
     if (state->window_log) {
         fclose(state->window_log);
+        state->window_log = NULL;
     }
     
     // Free the existing window buffer
@@ -528,7 +548,7 @@ void clear_sender_state(sender_state_t *state) {
         free(state->timers);
         state->timers = NULL;
     }
-    
+    int flow_id = state->flow_id;
     // Reset state values
     state->last_packet_acked = 0;
     state->last_packet_sent = 0;
@@ -539,11 +559,12 @@ void clear_sender_state(sender_state_t *state) {
     state->ssthresh = INITIAL_SSTHRESH;
     state->congestion_state = SLOW_START;
     state->dup_ack_count = 0;
+    state->flow_id = flow_id;
     
     // Reopen log file
-    char log_filename[50];
-    sprintf(log_filename, "problem2-peer.txt");
-    state->window_log = fopen(log_filename, "a");
+    //char log_filename[50];
+    //sprintf(log_filename, "problem2-peer.txt");
+    state->window_log = fopen("problem2-peer.txt", "a");
     
     // Record start time
     gettimeofday(&state->start_time, NULL);
@@ -593,6 +614,7 @@ sender_state_t *get_sender_state(struct sockaddr_in *from) {
   new_state->ssthresh = INITIAL_SSTHRESH;
   new_state->congestion_state = SLOW_START;
   new_state->chunk_id = 0;
+  new_state->flow_id = get_unique_flow_id();
   new_state->dup_ack_count = 0;
   new_state->window = NULL;
   new_state->timers = NULL;
@@ -616,6 +638,8 @@ sender_state_t *get_sender_state(struct sockaddr_in *from) {
   new_state->next = sender_states;
   sender_states = new_state;
   
+  log_window_size(new_state);
+
   return new_state;
 }
 
@@ -1367,12 +1391,15 @@ void ack_handler(packet_t *pack, struct sockaddr_in from, int sock) {
       DEBUG_PRINT("Setting ssthresh to %d\n", state->ssthresh);
       
       // Reset to slow start
+      int old_window_size = state->window_size;
       state->window_size = 1;
       state->congestion_state = SLOW_START;
       state->dup_ack_count = 0;
       
       // Log window size change
-      log_window_size(state);
+      if (old_window_size != state->window_size) {
+        log_window_size(state);
+      }
       
       // Retransmit the missing packet (with sequence number last_packet_acked + 1)
       int retx_seq = state->last_packet_acked + 1;
@@ -1398,31 +1425,46 @@ void ack_handler(packet_t *pack, struct sockaddr_in from, int sock) {
     state->last_packet_acked = pack_ack;
     
     // Update window size based on congestion control algorithm
+    int old_window_size = state->window_size;
+    
     if (state->congestion_state == SLOW_START) {
-      if (state->window_size < state->ssthresh) {
-        // Only increase window size if we're below ssthresh
-        int old_window_size = state->window_size;
-        state->window_size += new_acks;
-        
-        // Cap window size at ssthresh to prevent excessive growth
-        if (state->window_size >= state->ssthresh) {
-          state->window_size = state->ssthresh;
-          DEBUG_PRINT("Reached ssthresh (%d), capping window size at %d\n", 
-                     state->ssthresh, state->window_size);
-        } else {
-          DEBUG_PRINT("Slow start: increased window_size from %d to %d\n", 
-                     old_window_size, state->window_size);
-        }
-      } else {
-        // Already at or above ssthresh, maintain window size
-        DEBUG_PRINT("At ssthresh (%d), maintaining window size at %d\n", 
-                   state->ssthresh, state->window_size);
+      // In slow start, window size increases exponentially until reaching ssthresh
+      state->window_size += new_acks;
+      
+      DEBUG_PRINT("Slow start: increased window_size from %d to %d\n", 
+                 old_window_size, state->window_size);
+      
+      // Transition to congestion avoidance when window size reaches ssthresh
+      if (state->window_size >= state->ssthresh) {
+        state->congestion_state = CONGESTION_AVOIDANCE;
+        DEBUG_PRINT("Transition to congestion avoidance at window size %d\n", 
+                   state->window_size);
       }
     }
-    // REMOVED congestion avoidance mode - window size remains constant after reaching ssthresh
+    else if (state->congestion_state == CONGESTION_AVOIDANCE) {
+      // In congestion avoidance, add 1/window_size to window_size for each ACK      
+      
+      // store fractional increase using a static variable
+      static float f_increase = 0.0;
+      
+      // each ACK in congestion avoidance + 1/window_size
+      f_increase += ((float)new_acks / (float)old_window_size);
+      
+      // If the accumulated increase is at least 1, increase window size
+      if (f_increase >= 1.0) {
+        int increase = (int)f_increase;
+        state->window_size += increase;
+        f_increase -= increase;
+        
+        DEBUG_PRINT("Congestion avoidance: increased window_size from %d to %d\n", 
+                   old_window_size, state->window_size);
+      }
+    }
     
     // Log window size change
-    log_window_size(state);
+    if (old_window_size != state->window_size) {
+      log_window_size(state);
+    }
     
     // Make sure our buffer can handle the window size
     ensure_window_capacity(state);
@@ -1648,6 +1690,8 @@ void peer_run(bt_config_t *config) {
   struct sockaddr_in myaddr;
   fd_set readfds;
   struct user_iobuf *userbuf;
+
+  gettimeofday(&program_start_time, NULL); // Initialize program start time
 
   get_master_data_file(config->chunk_file);
   mdf = fopen(master_data_file, "r");
