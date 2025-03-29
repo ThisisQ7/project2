@@ -12,6 +12,8 @@
 #include "chunk.h"
 #include <assert.h>
 #include <sys/time.h>
+#include <signal.h>
+
 
 /* Packet and network parameters */
 #define PACKETLEN       1500
@@ -25,7 +27,7 @@
 #define CHUNK_SIZE      (512*1024)
 
 /* Sliding window & congestion control parameters */
-#define WINDOW_SIZE     8
+//#define WINDOW_SIZE     8
 #define TIMEOUT         300            /* in milliseconds */
 #define MAX_PACKET_SIZE 1500
 #define PAYLOAD_SIZE    1024           /* The size of the packets we're sending */
@@ -49,6 +51,14 @@
     #define DEBUG_PRINT(fmt, args...) 
 #endif
 
+/* Helper functions for min and max operations */
+static inline int min(int a, int b) {
+    return a < b ? a : b;
+}
+
+static inline int max(int a, int b) {
+    return a > b ? a : b;
+}
 /*==================================================*/
 /* STRUCTS */
 
@@ -108,21 +118,32 @@ typedef struct sender_state{
   int last_packet_acked;
   int last_packet_sent;
   int last_packet_available;
-  int window_size;
+  int window_size;            // Dynamic window size for congestion control
+  int max_window_buffer;      // Maximum size of our window buffer
+  int ssthresh;               // Slow start threshold
+  int congestion_state;       // 0 = slow start, 1 = congestion avoidance
   size_t data_offset;
   size_t chunk_size;
   int chunk_id;
-  packet_t *window[WINDOW_SIZE]; //To do; change how this is initialized
+  packet_t **window;          // Dynamically allocated window buffer
+  struct timeval *timers;     // Dynamically allocated timers array
   int dup_ack_count;
-  struct timeval timers[WINDOW_SIZE];
   struct sender_state *next;
+  FILE *window_log;           // Log file for window size changes
+  struct timeval start_time;  // Time when this sender state was created
 } sender_state_t;
 
+
+#define SLOW_START 0
+#define CONGESTION_AVOIDANCE 1
+#define INITIAL_SSTHRESH 64  // Initial slow start threshold
+#define INITIAL_WINDOW_BUFFER 16
 /*==================================================*/
 /* GLOBAL VARIABLES */
 chunk_t *requested_chunks = NULL;
 int requested_num = 0;
 char master_data_file[100];
+FILE *mdf;
 
 //NEW
 sender_state_t *sender_states = NULL;
@@ -131,8 +152,7 @@ connection_state_t *conn_states = NULL;
 /* Global socket variable so that DATA and congestion-control routines can use it. */
 int sock;
 
-/* Global sender state for DATA transmission */
-sender_state_t *window8 = NULL;
+
 
 /*==================================================*/
 /* FUNCTION PROTOTYPES */
@@ -260,51 +280,343 @@ int packet_parser(packet_t* pkt) {
   return type;
 }
 
-/*
-* Auxilary helper function to get_sender_state's new state 
-* initialization functionality. 
-*
-* window_init simply allocates the window for the sender_state
-* The packets here in window are initilized to be the max possible size, 
-* to fit any scenario
-*/
-void window_init(sender_state_t *sender){
-
-  packet_t *instance;
-  int i;
-  for (i = 1; i <= WINDOW_SIZE ; i++) {
-    //MAX_PACKET_SIZE to account for other scenarios
-    instance = make_packet(DATA, MAX_PACKET_SIZE, i, 0, NULL);
-
-    //Indices: 8/0 1/1 2/2 3/3 4/4 5/5 6/6 7/7
-    DEBUG_PRINT("i: %d and iMoDWINDOW_SIZE: %d\n", i, i%WINDOW_SIZE);
-    sender->window[i%WINDOW_SIZE] = (packet_t *)malloc(MAX_PACKET_SIZE);
-    if (sender->window[i%WINDOW_SIZE] == NULL) {
-        perror("Failed to allocate memory for window packet");
-        exit(EXIT_FAILURE);
-      }
-
-    //Just copying over a template
-    memcpy(sender->window[i%WINDOW_SIZE], instance, MAX_PACKET_SIZE); 
-    free(instance);
-  }
-}
-
-/*
-* Helper pair to window_init, free_window will be called 
-* when we're freeing allocated state memory
- */
-void free_window(sender_state_t *sender) {
-  int i;
-
-  if (sender != NULL) {
-    for (i = 0; i < WINDOW_SIZE; i++) {
-      if (sender->window[i]) {
+/* New helper function to allocate the window buffer */
+void allocate_window_buffer(sender_state_t *sender, int buffer_size) {
+  // Free existing window buffer if any
+  if (sender->window != NULL) {
+    for (int i = 0; i < sender->max_window_buffer; i++) {
+      if (sender->window[i] != NULL) {
         free(sender->window[i]);
       }
     }
-    free(sender);
+    free(sender->window);
+    free(sender->timers);
   }
+  
+  // Allocate new window buffer and timers
+  sender->max_window_buffer = buffer_size;
+  sender->window = (packet_t **)malloc(buffer_size * sizeof(packet_t *));
+  if (sender->window == NULL) {
+    perror("Failed to allocate memory for window buffer");
+    exit(EXIT_FAILURE);
+  }
+  
+  sender->timers = (struct timeval *)malloc(buffer_size * sizeof(struct timeval));
+  if (sender->timers == NULL) {
+    perror("Failed to allocate memory for timers");
+    free(sender->window);
+    exit(EXIT_FAILURE);
+  }
+  
+  // Initialize window buffer with packet templates
+  for (int i = 0; i < buffer_size; i++) {
+    sender->window[i] = (packet_t *)malloc(MAX_PACKET_SIZE);
+    if (sender->window[i] == NULL) {
+      perror("Failed to allocate memory for window packet");
+      // Clean up previously allocated memory
+      for (int j = 0; j < i; j++) {
+        free(sender->window[j]);
+      }
+      free(sender->window);
+      free(sender->timers);
+      exit(EXIT_FAILURE);
+    }
+    
+    // Initialize with a template DATA packet
+    packet_t *template = make_packet(DATA, MAX_PACKET_SIZE, i + 1, 0, NULL);
+    memcpy(sender->window[i], template, MAX_PACKET_SIZE);
+    free(template);
+    
+    // Initialize timer
+    gettimeofday(&sender->timers[i], NULL);
+  }
+  
+  DEBUG_PRINT("Allocated window buffer of size %d\n", buffer_size);
+}
+
+/* Replace the old window_init function with this improved version */
+void window_init(sender_state_t *sender) {
+  // Start with a reasonable buffer size (can be expanded later if needed)
+  int initial_buffer_size = max(INITIAL_WINDOW_BUFFER, sender->ssthresh);
+  
+  // Initialize sender's window pointers
+  sender->window = NULL;
+  sender->timers = NULL;
+  
+  // Allocate the window buffer
+  allocate_window_buffer(sender, initial_buffer_size);
+}
+
+/* Update free_window to handle the dynamic allocation */
+void free_window(sender_state_t *sender) {
+  if (sender != NULL) {
+    if (sender->window != NULL) {
+      for (int i = 0; i < sender->max_window_buffer; i++) {
+        if (sender->window[i] != NULL) {
+          free(sender->window[i]);
+        }
+      }
+      free(sender->window);
+      sender->window = NULL;
+    }
+    
+    if (sender->timers != NULL) {
+      free(sender->timers);
+      sender->timers = NULL;
+    }
+    
+  }
+}
+
+
+/**
+ * ensure_window_capacity
+ * 
+ * Ensures the window buffer is large enough for the current window size.
+ */
+void ensure_window_capacity(sender_state_t *state) {
+  // If our congestion window size exceeds our buffer capacity, expand the buffer
+  if (state->window_size > state->max_window_buffer) {
+    int new_size = max(state->window_size, state->max_window_buffer * 2);
+    DEBUG_PRINT("Expanding window buffer from %d to %d\n", state->max_window_buffer, new_size);
+    
+    // Allocate new buffers
+    packet_t **new_window = (packet_t **)malloc(new_size * sizeof(packet_t *));
+    if (new_window == NULL) {
+      perror("Failed to expand window buffer");
+      return; // Continue with current buffer
+    }
+    
+    struct timeval *new_timers = (struct timeval *)malloc(new_size * sizeof(struct timeval));
+    if (new_timers == NULL) {
+      perror("Failed to expand timers buffer");
+      free(new_window);
+      return; // Continue with current buffer
+    }
+    
+    // Initialize all pointers to NULL for safety
+    for (int i = 0; i < new_size; i++) {
+      new_window[i] = NULL;
+    }
+    
+    // Copy existing packets and timers
+    for (int i = 0; i < state->max_window_buffer; i++) {
+      new_window[i] = state->window[i];
+      new_timers[i] = state->timers[i];
+      
+      // Detach pointers from old array to prevent double free later
+      state->window[i] = NULL;
+    }
+    
+    // Initialize new slots
+    for (int i = state->max_window_buffer; i < new_size; i++) {
+      new_window[i] = (packet_t *)malloc(MAX_PACKET_SIZE);
+      if (new_window[i] == NULL) {
+        perror("Failed to allocate packet in expanded window");
+        
+        // Clean up already allocated new slots
+        for (int j = state->max_window_buffer; j < i; j++) {
+          free(new_window[j]);
+        }
+        
+        // Restore original pointers to prevent memory leaks
+        for (int j = 0; j < state->max_window_buffer; j++) {
+          state->window[j] = new_window[j];
+        }
+        
+        free(new_window);
+        free(new_timers);
+        return; // Continue with current buffer
+      }
+      
+      // Initialize with a template packet
+      packet_t *template = make_packet(DATA, MAX_PACKET_SIZE, i + 1, 0, NULL);
+      if (template == NULL) {
+        perror("Failed to create template packet");
+        free(new_window[i]);
+        
+        // Clean up already allocated new slots
+        for (int j = state->max_window_buffer; j < i; j++) {
+          free(new_window[j]);
+        }
+        
+        // Restore original pointers
+        for (int j = 0; j < state->max_window_buffer; j++) {
+          state->window[j] = new_window[j];
+        }
+        
+        free(new_window);
+        free(new_timers);
+        return;
+      }
+      
+      memcpy(new_window[i], template, MAX_PACKET_SIZE);
+      free(template);
+      
+      // Initialize timer
+      gettimeofday(&new_timers[i], NULL);
+    }
+    
+    // Free old arrays without freeing the packet pointers (we moved them)
+    packet_t **old_window = state->window;
+    struct timeval *old_timers = state->timers;
+    
+    // Update state with new arrays
+    state->window = new_window;
+    state->timers = new_timers;
+    state->max_window_buffer = new_size;
+    
+    // Free old arrays
+    free(old_window);
+    free(old_timers);
+    
+    DEBUG_PRINT("Successfully expanded window buffer to %d\n", new_size);
+  }
+}
+
+/* Add this helper function to log window size changes */
+void log_window_size(sender_state_t *state) {
+    if (state->window_log) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long elapsed_ms = (now.tv_sec - state->start_time.tv_sec) * 1000 + 
+                         (now.tv_usec - state->start_time.tv_usec) / 1000;
+        
+        // Use the peer's address as a unique flow identifier
+        fprintf(state->window_log, "f%d\t%ld\t%d\n", 
+                ntohs(state->addr.sin_port), elapsed_ms, state->window_size);
+        fflush(state->window_log);
+    }
+}
+void free_sender_state(sender_state_t *state) {
+    if (state) {
+        // Close the window log file if open
+        if (state->window_log) {
+            fclose(state->window_log);
+            state->window_log = NULL;
+        }
+        
+        // Free window buffer
+        free_window(state);
+    }
+}
+
+
+/**
+ * clear_sender_state
+ * 
+ * Resets a sender state for reuse.
+ */
+void clear_sender_state(sender_state_t *state) {
+    DEBUG_PRINT("Clearing existing sender state\n");
+    
+    // Close the window log file if open
+    if (state->window_log) {
+        fclose(state->window_log);
+    }
+    
+    // Free the existing window buffer
+    if (state->window) {
+        for (int i = 0; i < state->max_window_buffer; i++) {
+            free(state->window[i]);
+        }
+        free(state->window);
+        state->window = NULL;
+    }
+    
+    if (state->timers) {
+        free(state->timers);
+        state->timers = NULL;
+    }
+    
+    // Reset state values
+    state->last_packet_acked = 0;
+    state->last_packet_sent = 0;
+    state->last_packet_available = 1;
+    state->chunk_id = 0;
+    state->data_offset = 0;
+    state->window_size = 1;
+    state->ssthresh = INITIAL_SSTHRESH;
+    state->congestion_state = SLOW_START;
+    state->dup_ack_count = 0;
+    
+    // Reopen log file
+    char log_filename[50];
+    sprintf(log_filename, "problem2-peer.txt");
+    state->window_log = fopen(log_filename, "a");
+    
+    // Record start time
+    gettimeofday(&state->start_time, NULL);
+    
+    // Log initial window size
+    log_window_size(state);
+}
+
+
+
+/*
+* get_sender_state is a helper function useful in initializing sender states
+* if a state already exists, i.e. the peer was previously used, 
+* it clears it's metadata to make it ready for the next transmission phase.
+* 
+* For a new peer, on the other hand, a new sender state is initialized
+*/
+sender_state_t *get_sender_state(struct sockaddr_in *from) {
+  sender_state_t *curr = sender_states;
+
+  // Search for an existing sender state that matches the sender's address.
+  while (curr != NULL) {
+    if ((curr->addr.sin_addr.s_addr == from->sin_addr.s_addr)
+        && (curr->addr.sin_port == from->sin_port)) {
+      clear_sender_state(curr);
+      window_init(curr);
+      return curr;
+    }
+    curr = curr->next;
+  }
+  
+  // No existing state found; allocate a new sender state.
+  sender_state_t *new_state = malloc(sizeof(sender_state_t));
+  if (!new_state) {
+    perror("malloc for sender_state failed");
+    return NULL;
+  }
+  
+  // Initialize the new state
+  memset(new_state, 0, sizeof(sender_state_t));
+  new_state->addr = *from;
+  new_state->last_packet_acked = 0;
+  new_state->last_packet_sent = 0;
+  new_state->last_packet_available = 1; // Start with window size of 1
+  new_state->chunk_size = CHUNK_SIZE;
+  new_state->window_size = 1;           // Start with window size of 1 for slow start
+  new_state->ssthresh = INITIAL_SSTHRESH;
+  new_state->congestion_state = SLOW_START;
+  new_state->chunk_id = 0;
+  new_state->dup_ack_count = 0;
+  new_state->window = NULL;
+  new_state->timers = NULL;
+  
+  // Create log file for window size changes
+  char log_filename[50];
+  sprintf(log_filename, "problem2-peer.txt");
+  new_state->window_log = fopen(log_filename, "a");
+  if (!new_state->window_log) {
+    perror("Failed to open window size log file");
+    // Continue without logging
+  }
+  
+  // Record start time
+  gettimeofday(&new_state->start_time, NULL);
+  
+  // Initialize window
+  window_init(new_state);
+  
+  // Insert at head of global list
+  new_state->next = sender_states;
+  sender_states = new_state;
+  
+  return new_state;
 }
 
 /**
@@ -325,81 +637,6 @@ sender_state_t* find_sender_state(struct sockaddr_in *from) {
   }
   return NULL;
 }
-
-/*
-* clear_sender_state is a helper function that readies an already allocated 
-* sender_state space for a few sender connection
-*/
-void clear_sender_state(sender_state_t *state){
-  DEBUG_PRINT("Clearing existing sender state \n");
-
-  state->last_packet_acked = 0;   // Start with sequence number 1.
-  state->last_packet_sent = 0;
-  state->last_packet_available = 8;
-  state->chunk_id = 0;
-  state->data_offset = 0;
-  state->window_size = WINDOW_SIZE;
-
-  int i;
-  for (i = 0; i < WINDOW_SIZE ; i++) {
-    DEBUG_PRINT("Freeing up window index i: %d\n", i);
-    free(state->window[i]);
-  }
-}
-
-/*
-* get_sender_state is a helper function useful in initializing sender states
-* if a state already exists, i.e. the peer was previously used, 
-* it clears it's metadata to make it ready for the next transmission phase.
-* 
-* For a new peer, on the other hand, a new sender state is initialized
-*/
-sender_state_t *get_sender_state(struct sockaddr_in *from){
-  sender_state_t *curr = sender_states;
-
-  // Search for an existing sender state that matches the sender's address.
-  while (curr != NULL) {
-    if ((curr->addr.sin_addr.s_addr == from->sin_addr.s_addr)
-        && (curr->addr.sin_port == from->sin_port )) {
-          clear_sender_state(curr);
-          window_init(curr);
-          return curr;
-    }
-    curr = curr->next;
-  }
-  
-  // No existing state found; allocate a new sender state.
-  sender_state_t *new_state = malloc(sizeof(sender_state_t));
-  if (!new_state) {
-      perror("malloc for sender_state failed");
-      return NULL;
-  }
-  
-  // Copy the sender's address.
-  new_state->addr = *from;
-  new_state->last_packet_acked = 0;   // Start with sequence number 1.
-  new_state->last_packet_sent = 0;
-  new_state->last_packet_available = 8;
-  new_state->chunk_size = CHUNK_SIZE;
-  new_state->window_size = WINDOW_SIZE;
-  new_state->chunk_id = 0;  //TODO, is this halal, to assume that we own the chunk we're being requested?
-  
-  // Allocate the buffer for the incoming chunk data.
-  // new_state->window = malloc(new_state->window_size * sizeof(packet_t));
-  window_init(new_state);
-  if (!new_state->window) {
-      perror("malloc for window failed");
-      free(new_state);
-      return NULL;
-  }
-  new_state->data_offset = 0;
-  
-  // Insert the new connection state at the beginning of the global list.
-  new_state->next = sender_states;
-  sender_states = new_state;
-  
-  return new_state;
- }
 
 connection_state_t* get_connection_state(struct sockaddr_in *from, uint8_t *hash) {
     // Search for an existing connection state matching the sender address.
@@ -669,7 +906,7 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         get_handler(pkt->data, from, config);
         break;
       }
-      case DATA: {
+      case DATA: {        
         uint32_t seq_num = ntohl(pkt->header.seq_num);
         short packet_len = ntohs(pkt->header.packet_len);
         short header_len = ntohs(pkt->header.header_len);
@@ -678,6 +915,7 @@ void process_inbound_udp(int sock, bt_config_t *config) {
 
         DEBUG_PRINT("Received DATA packet (seq=%d) from %s:%d, data length=%d bytes\n",
                seq_num, inet_ntoa(from.sin_addr), ntohs(from.sin_port), data_len);
+
         connection_state_t *conn = find_connection_state(&from);
         if (!conn) {
           fprintf(stderr, "Failed to get connection state for sender %s:%d\n",
@@ -685,11 +923,21 @@ void process_inbound_udp(int sock, bt_config_t *config) {
           break;
         }
 
+        char chash[40];
+        binary2hex(conn->hash, SHA1_HASH_SIZE, chash);
+        int id = lookup_id(config->chunk_file, chash);
+
         //update connection state buffer with packet data, shift connection state offset & expected packet.
         if (seq_num == conn->expected_seq) {
           //calculate distance of offset from chunnk border
           printf("conn->data_offset: %ld \n", conn->data_offset);
           int diff = conn->chunk_size - conn->data_offset;
+
+          char chunk_segment[data_len];
+          fseek(mdf, (id * BT_CHUNK_SIZE) + conn->data_offset, SEEK_SET);
+          fread(chunk_segment, sizeof(char), data_len, mdf);
+
+          printf("Comparing packet data with chunk data: %d\n", memcmp(chunk_segment, pkt->data, data_len));
 
           if((diff) < data_len){
             DEBUG_PRINT("Last packet received, with required offset: %d\n", diff);
@@ -707,6 +955,8 @@ void process_inbound_udp(int sock, bt_config_t *config) {
           DEBUG_PRINT("conn->chunk_size: %ld \n", conn->chunk_size );
 
           ack_num = seq_num;
+
+
           
           if (conn->data_offset > conn->chunk_size) {
             DEBUG_PRINT("Chunk fully received from %s:%d\n",
@@ -733,31 +983,32 @@ void process_inbound_udp(int sock, bt_config_t *config) {
         free(ack_pkt);
 
         if(conn->data_offset == conn->chunk_size){
-          char chash[40];
-          binary2hex(conn->hash, SHA1_HASH_SIZE, chash);
           DEBUG_PRINT("Finished downloading chunk: %s\n", chash);
 
+          
+          FILE *f = fopen(master_data_file, "r");
+          int id = lookup_id(config->chunk_file, chash);
 
-          // FILE *f = fopen("tmp/C.tar", "r");
+
           // FILE *fw = fopen("testOutputChunk4.txt", "w");
           // fwrite(conn->data_buffer, sizeof(char), CHUNK_SIZE, fw);
-          // fseek(f, 3 * CHUNK_SIZE, SEEK_SET);
-          // char test_chunk[CHUNK_SIZE];
-          // fread(test_chunk, 1, CHUNK_SIZE, f);
+          fseek(f, id * CHUNK_SIZE, SEEK_SET);
+          char test_chunk[CHUNK_SIZE];
+          fread(test_chunk, 1, CHUNK_SIZE, f);
 
-          // int diffCount = 0;
-          // // printf("First 101 chracters from con->data_buffer: %.101s\nFirst 101 characters from test_chunk: %.101s\n", conn->data_buffer, test_chunk);
-          // for (size_t i = 0; i < CHUNK_SIZE; i++) {
-          //     if (conn->data_buffer[i] != test_chunk[i]) {
-          //       // printf("i :%d", i);
-          //       diffCount++;
-          //     }
-          // }
+          int diffCount = 0;
+          // printf("First 101 chracters from con->data_buffer: %.101s\nFirst 101 characters from test_chunk: %.101s\n", conn->data_buffer, test_chunk);
+          for (size_t i = 0; i < CHUNK_SIZE; i++) {
+              if (conn->data_buffer[i] != test_chunk[i]) {
+                // printf("i :%d", i);
+                diffCount++;
+              }
+          }
       
-          // printf("Number of differing bytes: %d\n", diffCount);
-          // printf("Similarity: %.2f%%\n", 100.0 * (CHUNK_SIZE - diffCount) / CHUNK_SIZE);
+          printf("Number of differing bytes: %d\n", diffCount);
+          printf("Similarity: %.2f%%\n", 100.0 * (CHUNK_SIZE - diffCount) / CHUNK_SIZE);
 
-          // fclose(f);
+          fclose(f);
           // fclose(fw);
 
           commit_chunk(conn);
@@ -911,19 +1162,22 @@ void handle_user_input(char *line, void *cbdata, bt_config_t *config, int sock) 
  * Given an open file (typically the master chunk file) and a chunk hash (as a hex string),
  * returns the id (i.e. position/index) for that chunk.
  */
-int lookup_id(FILE *f, char *buf) {
+int lookup_id(char *chunkfile, char *buf) {
+  FILE *f = fopen(chunkfile, "r");
   char list_elem[LIST_ELEM_SIZE];
   char hash[40];
   int id;
-  DEBUG_PRINT("buf: %s\n", buf);
+  // DEBUG_PRINT("buf: %s\n", buf);
   while (fgets(list_elem, LIST_ELEM_SIZE, f) != NULL) {
     sscanf(list_elem, "%d %s", &id, hash);
-    DEBUG_PRINT("hash: %s\n", hash);
+    // DEBUG_PRINT("hash: %s\n", hash);
     if (strcmp(hash, buf) == 0) {
-      DEBUG_PRINT("id from lookup_id: %d\n", id);
+      // DEBUG_PRINT("id from lookup_id: %d\n", id);
+      fclose(f);
       return id;
     }
   }
+  fclose(f);
   return -1;
 }
 
@@ -935,12 +1189,30 @@ int lookup_id(FILE *f, char *buf) {
  */
 void send_data_packet(struct sockaddr_in from, sender_state_t *state, int sock) {
   int seq_num = state->last_packet_sent + 1;
-  packet_t *currpack = state->window[(seq_num % WINDOW_SIZE)];
+  
+  // Make sure we're using the correct index in our window buffer
+  int window_index = seq_num % state->max_window_buffer;
+  packet_t *currpack = state->window[window_index];
+  
+  // Update packet header
+  currpack->header.seq_num = htonl(seq_num);
+  currpack->header.packet_len = htons(HEADERLEN + PAYLOAD_SIZE);
+  
+  // Read data from the master file
   short packet_len = ntohs(currpack->header.packet_len);
   short header_len = ntohs(currpack->header.header_len);
   size_t len = packet_len - header_len;
-  DEBUG_PRINT("len: %ld\n", len);
-  char line[len];
+  
+  // Check if we're at the end of the chunk
+  size_t remaining = (state->chunk_id + 1) * state->chunk_size - state->data_offset;
+  if (remaining < len) {
+    len = remaining;
+    currpack->header.packet_len = htons(header_len + len);
+  }
+  
+  DEBUG_PRINT("Reading %ld bytes at offset %ld for packet %d\n", len, state->data_offset, seq_num);
+  
+  char buffer[len];
   FILE *f = fopen(master_data_file, "r");
   if (!f) {
     perror("Failed to open master data file");
@@ -948,18 +1220,29 @@ void send_data_packet(struct sockaddr_in from, sender_state_t *state, int sock) 
   }
 
   fseek(f, state->data_offset, SEEK_SET);
-  fread(line, sizeof(char), len, f);
-  memcpy(currpack->data, line, len);
+  fread(buffer, sizeof(char), len, f);
+  memcpy(currpack->data, buffer, len);
   fclose(f);
-  // spiffy_sendto(sock, currpack, currpack->header.packet_len, 0, (struct sockaddr *)&from, sizeof(from));
-  int bytes_sent = spiffy_sendto(sock, currpack, ntohs(currpack->header.packet_len), 0, (struct sockaddr *)&from, sizeof(from));
+  
+  // Send the packet
+  int bytes_sent = spiffy_sendto(sock, currpack, ntohs(currpack->header.packet_len), 0, 
+                               (struct sockaddr *)&from, sizeof(from));
   if (bytes_sent < 0) {
-      perror("spiffy_sendto failed");
+    perror("spiffy_sendto failed");
   } else {
-      DEBUG_PRINT("spiffy_sendto sent %d bytes\n", bytes_sent);
+    DEBUG_PRINT("spiffy_sendto sent %d bytes for packet %d\n", bytes_sent, seq_num);
   }
+  
+  // Update timer for this packet
+  gettimeofday(&state->timers[window_index], NULL);
+  
+  // Update last packet sent
   state->last_packet_sent = seq_num;
+  
+  // Update data offset for next packet
+  state->data_offset += len;
 }
+
 
 /**
  * start_data_transmission
@@ -968,28 +1251,61 @@ void send_data_packet(struct sockaddr_in from, sender_state_t *state, int sock) 
  * an initial burst of DATA packets.
  */
 void start_data_transmission(int id, struct sockaddr_in from, int sock) {
-  DEBUG_PRINT("In start_data_transmission\n");
-  //HERE is where we start the sender state
+  DEBUG_PRINT("In start_data_transmission for chunk id %d\n", id);
+  
+  // Get or create a sender state for this peer
   sender_state_t *state = get_sender_state(&from);
-
-  //chunk_id here keeps track of the order of chunk files
-  state->chunk_id = id;
-
-  DEBUG_PRINT("Window initialized\n");
-  int i;
-  for (i = 0; i < WINDOW_SIZE; i++) {
-    // DEBUG_PRINT("Send packet i: %d\n", i);
-    //We're adding 1 to i to account for how we're indexing in the window, rememeber 8/0, 1/1, ... 7/7
-    packet_t *curr_pack = state->window[(i+1)%WINDOW_SIZE];
-    curr_pack->header.packet_len = htons(HEADERLEN + PAYLOAD_SIZE);
-
-    short packet_len = ntohs(curr_pack->header.packet_len);
-    short header_len = ntohs(curr_pack->header.header_len);
-
-    state->data_offset = (state->chunk_id * BT_CHUNK_SIZE) + (i * (packet_len - header_len));
-    // DEBUG_PRINT("state->data_offset: %d\n and len difference: %d\n",state->data_offset,curr_pack->header.packet_len - curr_pack->header.header_len);
-    send_data_packet(from, state, sock);
+  if (!state) {
+    DEBUG_PRINT("Failed to create sender state\n");
+    return;
   }
+  
+  // Set the chunk ID for this transmission
+  state->chunk_id = id;
+  
+  // Initialize congestion control variables
+  state->last_packet_acked = 0;
+  state->last_packet_sent = 0;
+  state->last_packet_available = 1; // In slow start, we only send one packet initially
+  state->window_size = 1;           // Start with window size of 1
+  state->congestion_state = SLOW_START;
+  state->ssthresh = INITIAL_SSTHRESH;
+  state->dup_ack_count = 0;
+  
+  DEBUG_PRINT("Congestion control initialized: window_size=%d, ssthresh=%d\n", 
+             state->window_size, state->ssthresh);
+  
+  // Log initial window size
+  log_window_size(state);
+  
+  // Calculate the initial data offset
+  state->data_offset = (state->chunk_id * BT_CHUNK_SIZE);
+  
+  // Send the first packet
+  send_data_packet(from, state, sock);
+  
+  DEBUG_PRINT("Successfully started data transmission in slow start mode for chunk %d\n", id);
+}
+
+
+
+/* 
+ * get_master_data_file sets the global variable containing master datafile
+*/
+void get_master_data_file(char *chunkfile){
+  FILE *f = fopen(chunkfile, "r");
+  if (!f) {
+    perror("Failed to open master chunk file in get_handler");
+    return;
+  }
+  char list_elem[LIST_ELEM_SIZE];
+  /* The first line of the master chunk file is expected to be of the form:
+     "File: <master_data_file>"
+  */
+  fgets(list_elem, LIST_ELEM_SIZE, f);
+  sscanf(list_elem, "File: %s\n", master_data_file);
+  DEBUG_PRINT("Master data file: %s\n", master_data_file);
+  fclose(f);
 }
 
 /**
@@ -1002,101 +1318,153 @@ void get_handler(char *msg, struct sockaddr_in from, bt_config_t *config) {
   DEBUG_PRINT("Handling GET: master chunk file is %s\n", config->chunk_file);
   char buf[40];
   binary2hex(msg, 20, buf);
-  FILE *f = fopen(config->chunk_file, "r");
-  if (!f) {
-    perror("Failed to open master chunk file in get_handler");
-    return;
-  }
-  char list_elem[LIST_ELEM_SIZE];
-  /* The first line of the master chunk file is expected to be of the form:
-     "File: <master_data_file>"
-  */
-  fgets(list_elem, LIST_ELEM_SIZE, f);
-  sscanf(list_elem, "File: %s\n", master_data_file);
-  DEBUG_PRINT("Master data file: %s\n", master_data_file);
-  fseek(f, 0, SEEK_SET);
-  int id = lookup_id(f, buf);
-  fclose(f);
+
+  int id = lookup_id(config->chunk_file, buf);
   DEBUG_PRINT("Starting data transmission for chunk id %d\n", id);
   start_data_transmission(id, from, sock);
 }
 
-/*
-* ack_handler updates relevant sender state, and regenerates relevant window
-
- */
-void ack_handler(packet_t *pack, struct sockaddr_in from, int sock){
-  DEBUG_PRINT("Acknowledgeing Packet number: %d\n", ntohl(pack->header.ack_num)); 
+void ack_handler(packet_t *pack, struct sockaddr_in from, int sock) {
+  DEBUG_PRINT("Acknowledging Packet number: %d\n", ntohl(pack->header.ack_num)); 
 
   sender_state_t *state = find_sender_state(&from);
-  // FILE *f = fopen(master_data_file, "r");
+  if (!state) {
+    DEBUG_PRINT("No sender state found for this peer\n");
+    return;
+  }
 
   int pack_ack = ntohl(pack->header.ack_num);
 
-  //TODO: again, might not need this
-  if (strncmp(pack->data, "Done", 4) == 0){
+  // Check if this is a "Done" message
+  if (pack->data && strncmp(pack->data, "Done", 4) == 0) {
     DEBUG_PRINT("End of current connection\n");
     return;
   }
   
-  if (state->last_packet_sent < state->last_packet_acked){
+  // Sanity checks
+  if (state->last_packet_sent < state->last_packet_acked) {
     perror("Incorrect packet sequence updating\n");
     exit(EXIT_FAILURE);
   }
 
-  if(state->last_packet_available < pack_ack){
+  if (state->last_packet_available < pack_ack) {
     perror("Packet ACK received is higher than last packet available in window\n");
     exit(EXIT_FAILURE);
   }
 
-  /*if(state->last_packet_sent <= state->last_packet_acked){
-    perror("Last Packet Send is lower than last packet acknowledged\n");
-    exit(EXIT_FAILURE);
-  }*/
+  // Handle duplicate ACKs (Fast Retransmit)
   if (pack_ack == state->last_packet_acked) {
     state->dup_ack_count++;
     DEBUG_PRINT("Duplicate ACK count increased to %d for ack %d\n",
                 state->dup_ack_count, pack_ack);
+    
+    // Fast Retransmit: If 3 duplicate ACKs are received, retransmit the missing packet
     if (state->dup_ack_count >= 3) {
       DEBUG_PRINT("Fast retransmit triggered for ack %d\n", pack_ack);
+      
+      // Set ssthresh to half the current window size (min 2)
+      state->ssthresh = max(state->window_size / 2, 2);
+      DEBUG_PRINT("Setting ssthresh to %d\n", state->ssthresh);
+      
+      // Reset to slow start
+      state->window_size = 1;
+      state->congestion_state = SLOW_START;
       state->dup_ack_count = 0;
+      
+      // Log window size change
+      log_window_size(state);
+      
       // Retransmit the missing packet (with sequence number last_packet_acked + 1)
-      send_data_packet(from, state, sock);
+      int retx_seq = state->last_packet_acked + 1;
+      int window_index = retx_seq % state->max_window_buffer;
+      packet_t *retx_packet = state->window[window_index];
+      
+      spiffy_sendto(sock, retx_packet, ntohs(retx_packet->header.packet_len), 0, 
+                   (struct sockaddr *)&from, sizeof(from));
+      
+      // Update timer for retransmitted packet
+      gettimeofday(&state->timers[window_index], NULL);
+      
+      DEBUG_PRINT("Retransmitted packet with seq %d\n", retx_seq);
     }
     return;
-  } else if (pack_ack > state->last_packet_acked){
-
-    if (pack_ack < 8){
-      state->last_packet_acked = pack_ack;
-      DEBUG_PRINT("Ignoring first 8 initialized: %d \n ", pack_ack);
-      return;
-    } 
+  } 
+  else if (pack_ack > state->last_packet_acked) {
+    // Reset duplicate ACK counter since we received a new ACK
     state->dup_ack_count = 0;
-    state->last_packet_acked = pack_ack;
-
-    //we can simply add to pack_ack because it the window is pack_ack + 1 inclusive
-    //pack_ack = 1;
-    //1 + 8 = 9
-    //len(2,3,4,5,6,7,8,9) <- 8
-    state->last_packet_available = pack_ack + WINDOW_SIZE;
     
+    // Calculate how many new packets were acknowledged
+    int new_acks = pack_ack - state->last_packet_acked;
+    state->last_packet_acked = pack_ack;
+    
+    // Update window size based on congestion control algorithm
+    if (state->congestion_state == SLOW_START) {
+      if (state->window_size < state->ssthresh) {
+        // Only increase window size if we're below ssthresh
+        int old_window_size = state->window_size;
+        state->window_size += new_acks;
+        
+        // Cap window size at ssthresh to prevent excessive growth
+        if (state->window_size >= state->ssthresh) {
+          state->window_size = state->ssthresh;
+          DEBUG_PRINT("Reached ssthresh (%d), capping window size at %d\n", 
+                     state->ssthresh, state->window_size);
+        } else {
+          DEBUG_PRINT("Slow start: increased window_size from %d to %d\n", 
+                     old_window_size, state->window_size);
+        }
+      } else {
+        // Already at or above ssthresh, maintain window size
+        DEBUG_PRINT("At ssthresh (%d), maintaining window size at %d\n", 
+                   state->ssthresh, state->window_size);
+      }
+    }
+    // REMOVED congestion avoidance mode - window size remains constant after reaching ssthresh
+    
+    // Log window size change
+    log_window_size(state);
+    
+    // Make sure our buffer can handle the window size
+    ensure_window_capacity(state);
+    
+    // Update last_packet_available based on new window size
+    state->last_packet_available = state->last_packet_acked + state->window_size;
+    
+    // Send new packets based on the updated window
     int seq_num;
-    //This for loop goes from the next packet, with reference to last_packet_sent, to the last available packet 
-    for (seq_num = state->last_packet_sent + 1; seq_num <= state->last_packet_available; seq_num++){
-      //we're using seq-1 since packet i starts from an offset of i-1
-      //TODO: keep track of the packet size in state
-      state->data_offset = (state->chunk_id * CHUNK_SIZE) + ((seq_num - 1) * PAYLOAD_SIZE);
-      state->window[seq_num % WINDOW_SIZE]->header.seq_num = htonl(seq_num);
-
-      if (state->data_offset > ((state->chunk_id + 1 ) * state->chunk_size)){
-        DEBUG_PRINT("Reading beyond chunk boundry\n");
-
+    for (seq_num = state->last_packet_sent + 1; seq_num <= state->last_packet_available; seq_num++) {
+      // Check if we've reached the end of the chunk
+      if (state->data_offset >= (state->chunk_id + 1) * state->chunk_size) {
+        DEBUG_PRINT("End of chunk reached at offset %ld\n", state->data_offset);
         break;
-      }      
-      //the second argument for print here simply demarkates the END byte number of the chunk we're reading from 
-      DEBUG_PRINT("Date Offset: %ld\n Chunk Size: %ld\n", state->data_offset, ((state->chunk_id + 1 ) * state->chunk_size));
-      DEBUG_PRINT("Data seq-num being sent after ack of %d: %d\n", pack_ack, seq_num);
+      }
+      
+      // Send the next packet
       send_data_packet(from, state, sock);
+    }
+    
+    // Check if we've completed the chunk transfer
+    if (state->data_offset >= (state->chunk_id + 1) * state->chunk_size && 
+        state->last_packet_acked >= state->last_packet_sent) {
+      DEBUG_PRINT("Chunk %d transfer completed\n", state->chunk_id);
+      
+      // Clean up sender state
+      sender_state_t *prev = NULL;
+      sender_state_t *curr = sender_states;
+      while (curr != NULL) {
+        if (curr == state) {
+          if (prev == NULL) {
+            sender_states = curr->next;
+          } else {
+            prev->next = curr->next;
+          }
+          free_sender_state(curr);
+          free(curr);
+          break;
+        }
+        prev = curr;
+        curr = curr->next;
+      }
     }
   }
 }
@@ -1176,7 +1544,7 @@ int done_download(){
 */
 void check_requested(bt_config_t *config){
   if (done_download()){
-    FILE *f = fopen(config->output_file, "a");
+    FILE *f = fopen(config->output_file, "wb+");
     printf("All chunks have finished downloading\n");
     int i;
     for (i = 0; i < requested_num; i++){
@@ -1242,6 +1610,31 @@ void download_chunk(int sock) {
     }
   }
 }
+/**
+ * cleanup_sender_states
+ * 
+ * Cleans up all sender states - should be called on program exit.
+ */
+void cleanup_sender_states() {
+    sender_state_t *curr = sender_states;
+    sender_state_t *next;
+    
+    while (curr != NULL) {
+        next = curr->next;
+        free_sender_state(curr);
+        free(curr);
+        curr = next;
+    }
+    sender_states = NULL;
+}
+/**
+ * Signal handler for cleanup
+ */
+void handle_signal(int sig) {
+    printf("\nCleaning up before exit...\n");
+    cleanup_sender_states();
+    exit(0);
+}
 /*--------------------------------------------------*/
 /* Main peer loop */
 
@@ -1255,6 +1648,9 @@ void peer_run(bt_config_t *config) {
   struct sockaddr_in myaddr;
   fd_set readfds;
   struct user_iobuf *userbuf;
+
+  get_master_data_file(config->chunk_file);
+  mdf = fopen(master_data_file, "r");
    
   if ((userbuf = create_userbuf()) == NULL) {
     perror("peer_run could not allocate userbuf");
@@ -1278,7 +1674,10 @@ void peer_run(bt_config_t *config) {
   }
    
   spiffy_init(config->identity, (struct sockaddr *)&myaddr, sizeof(myaddr));
-   
+  
+  // Add signal handlers for cleanup
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
   while (1) {
     int nfds;
     FD_ZERO(&readfds);
